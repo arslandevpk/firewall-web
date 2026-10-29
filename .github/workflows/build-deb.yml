@@ -30,6 +30,32 @@ jobs:
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
         run: packaging/build-deb.sh "$PACKAGE_VERSION"
+      - name: Install package and verify service
+        env:
+          PACKAGE_ARCHITECTURE: ${{ matrix.architecture }}
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          package="./dist/firewall-web_${PACKAGE_VERSION}_${PACKAGE_ARCHITECTURE}.deb"
+          test "$(dpkg-deb --field "$package" Architecture)" = "$PACKAGE_ARCHITECTURE"
+          sudo apt-get update
+          sudo apt-get install -y "$package"
+          sudo sed -i 's/^NFT_SECRET=.*/NFT_SECRET=1234/' /etc/firewall-web/firewall-web.env
+          sudo systemctl enable --now firewall-web.service
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:5005/ >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              sudo journalctl -u firewall-web.service --no-pager
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --fail --silent --show-error \
+            -H 'X-Secret: 1234' \
+            http://127.0.0.1:5005/api/status |
+            python3 -c 'import json,sys; status=json.load(sys.stdin); assert status["root"] is True; print("Service responds as root; detected nftables:", status["nft"])'
+          sudo systemctl is-active --quiet firewall-web.service
       - uses: actions/upload-artifact@v4
         with:
           name: firewall-web_${{ inputs.version }}_${{ matrix.architecture }}
