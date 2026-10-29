@@ -21,6 +21,21 @@ The installer refuses to overwrite an existing installation. It creates a venv,
 installs dependencies, writes a root-only environment file, and enables the
 firewall-web.service service. No application firewall changes occur at startup.
 
+DEBIAN PACKAGE ARTIFACTS
+Run the "Build Debian packages" workflow from the GitHub Actions tab and enter
+a package version to build amd64 and arm64 .deb artifacts. The packages require
+system Python, Flask 3.1+, Waitress 3+, iptables, nftables, and systemd.
+Install the matching artifact with:
+  sudo apt install ./firewall-web_VERSION_ARCH.deb
+The package installs a disabled service and a root-only configuration file with
+no PIN configured. Before starting the service, set your own four-digit PIN:
+  sudoedit /etc/firewall-web/firewall-web.env
+  sudo systemctl enable --now firewall-web.service
+Package builds can also be run locally with:
+  packaging/build-deb.sh VERSION [amd64|arm64]
+Omit the architecture to use the host architecture. The resulting package is
+written to the repository's dist/ directory.
+
 ACCESS
 Default: http://127.0.0.1:5005 on the host itself.
 From your own computer, open an SSH tunnel (replace USER and SERVER):

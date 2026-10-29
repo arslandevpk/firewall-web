@@ -1,0 +1,38 @@
+name: Build Debian packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Debian package version (for example, 1.2.3)
+        required: true
+        default: "1.0.0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build package
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: packaging/build-deb.sh "$PACKAGE_VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firewall-web_${{ inputs.version }}_${{ matrix.architecture }}
+          path: dist/firewall-web_${{ inputs.version }}_${{ matrix.architecture }}.deb
+          if-no-files-found: error
+          retention-days: 30
