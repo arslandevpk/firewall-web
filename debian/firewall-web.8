@@ -1,0 +1,35 @@
+.TH FIREWALL-WEB 8 "October 2026" "firewall-web 1.0.2" "System Administration"
+.SH NAME
+firewall-web \- local web console for the Linux firewall
+.SH SYNOPSIS
+.B firewall-web
+.SH DESCRIPTION
+.B firewall-web
+starts the authenticated local web interface on the configured address and port.
+The installed launcher reads its settings from
+.IR /etc/firewall-web/firewall-web.env .
+.PP
+The default listener is
+.BR 127.0.0.1:5005 .
+Use an SSH tunnel for remote access unless an authenticated HTTPS reverse proxy
+is configured.
+.SH SECURITY
+Firewall modifications require the process to run as root with effective
+.BR CAP_NET_ADMIN .
+Without both, the interface is read-only and rejects all write requests.
+Termux PRoot cannot alter the Android host firewall.
+.PP
+Set a private four-digit
+.B NFT_SECRET
+in the configuration file before starting. Do not expose the PIN-only service
+to untrusted networks.
+.SH FILES
+.TP
+.I /etc/firewall-web/firewall-web.env
+Root-only runtime configuration.
+.TP
+.I /usr/lib/firewall-web/firewall_web.py
+Application and bundled web assets.
+.SH SEE ALSO
+.BR nft (8),
+.BR iptables (8)

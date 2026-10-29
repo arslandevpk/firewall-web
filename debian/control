@@ -1,0 +1,26 @@
+Source: firewall-web
+Section: net
+Priority: optional
+Maintainer: arslandevpk <arslandevpk@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/arslandevpk/firewall-web
+Vcs-Browser: https://github.com/arslandevpk/firewall-web
+Vcs-Git: https://github.com/arslandevpk/firewall-web.git
+
+Package: firewall-web
+Architecture: all
+Depends:
+ ${misc:Depends},
+ python3 (>= 3.10),
+ python3-flask (>= 2.0),
+ python3-waitress (>= 2.0),
+ iptables,
+ nftables
+Recommends: systemd
+Description: local web console for the Linux firewall
+ View and manage nftables and IPv4/IPv6 iptables rules, configure masquerading,
+ save backups, and explicitly configure boot-time persistence. Firewall
+ modifications require root with CAP_NET_ADMIN; without it, the authenticated
+ web interface runs read-only.

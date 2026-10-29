@@ -6,11 +6,18 @@ set policies, allow service ports (including stateless mode), manage
 masquerading, export/back up rules, and explicitly save rules for reboot.
 Includes the responsive browser UI. No agent, hub, connected-server feature,
 Cloudflare account, external API, or Tailscale installation is required.
+The bundled Hack, JetBrains Mono, Fira Code, Source Code Pro, Cascadia Code,
+IBM Plex Mono, and Inconsolata fonts and their licenses are installed alongside
+the application; every font choice works offline.
 
 REQUIREMENTS
-Debian/Ubuntu with systemd, Python 3.10+, root/sudo, and internet for installing
-packages. Python dependencies are in requirements.txt. The installer installs
-iptables/nftables but does not flush rules or explicitly enable boot restore.
+To change firewall rules, this utility must be installed and run as root with
+CAP_NET_ADMIN; it administers the firewall visible to its Linux kernel. PRoot
+always starts in read-only mode. Without that capability, other environments
+also start in read-only mode. Debian/Ubuntu normally uses systemd; Alpine
+normally uses OpenRC. Python 3.10+ is required.
+Python dependencies are in requirements.txt.
+The installer installs iptables/nftables but does not flush rules or explicitly enable boot restore.
 Review package-manager changes when installing on an already managed host.
 
 FIRST INSTALL
@@ -19,25 +26,62 @@ Unzip the archive and enter its firewall-web-standalone directory, then run:
 Enter your OWN four-digit PIN. Leading zeros are supported. No PIN is shipped.
 The installer refuses to overwrite an existing installation. It creates a venv,
 installs dependencies, writes a root-only environment file, and enables the
-firewall-web.service service. No application firewall changes occur at startup.
+firewall-web.service service, which runs the utility as root. No application
+firewall changes occur at startup.
 
 DEBIAN PACKAGE ARTIFACTS
-Run the "Build Debian packages" workflow from the GitHub Actions tab and enter
-a package version to build amd64 and arm64 .deb artifacts. The packages require
-system Python 3.10+, Flask 2.0+, Waitress 2.0+, iptables, nftables, and systemd.
+Run the "Build Debian and Alpine packages" workflow from the GitHub Actions
+tab and enter a package version to build amd64 and arm64 .deb artifacts. The packages require
+system Python 3.10+, Flask 2.0+, Waitress 2.0+, iptables, and nftables.
+systemd is recommended for the optional service; it is not required to install
+or run the UI. CI installs each package in current Ubuntu and Debian userspaces
+with dependencies resolved from their unmodified default APT repositories.
+These artifacts are not yet published in the official distro repositories:
+`apt install firewall-web` requires Debian/Ubuntu archive acceptance and ongoing
+maintenance. A Debian source package is prepared and built by CI; passing those
+checks does not imply official archive acceptance or direct APT availability.
+Build it locally with `packaging/build-source-deb.sh [VERSION]` after installing
+`build-essential` and `debhelper`; outputs go to `dist/source/`.
 Install the matching artifact with:
   sudo apt install ./firewall-web_VERSION_ARCH.deb
 The package installs a disabled service and a root-only configuration file with
-no PIN configured. Before starting the service, set your own four-digit PIN:
+no PIN configured; its systemd service runs the utility as root. Before starting
+the service, set your own four-digit PIN:
   sudoedit /etc/firewall-web/firewall-web.env
   sudo systemctl enable --now firewall-web.service
+Without systemd, configure the same file and run `firewall-web` in the
+foreground from the package's root shell.
 Package builds can also be run locally with:
   packaging/build-deb.sh VERSION [amd64|arm64]
 Omit the architecture to use the host architecture. The resulting package is
 written to the repository's dist/ directory.
 
+ALPINE PACKAGE ARTIFACTS
+On Alpine Linux, build a package for the host architecture with:
+  packaging/build-apk.sh VERSION [x86_64|aarch64]
+The resulting .apk is written to dist/. Install it as root with:
+  apk add --allow-untrusted ./firewall-web_VERSION_ARCH.apk
+Set your own PIN in /etc/conf.d/firewall-web, then enable and start its OpenRC
+service with:
+  rc-update add firewall-web default
+  rc-service firewall-web start
+The package installs the service disabled. In a proot environment without a
+running init system, configure the file and run `firewall-web` in the foreground.
+
+USERSPACE, PROOT, AND UML
+The UI can run in Debian, Ubuntu, and Alpine userspace environments, including
+Termux PRoot. PRoot's simulated root is not kernel root: it cannot add/delete
+iptables or nftables rules on Android or the host. PRoot is always read-only;
+unprivileged containers without CAP_NET_ADMIN are read-only too. Write controls
+are disabled and all write API requests are rejected. A UML
+Linux guest can manage its own guest firewall only when its guest kernel grants
+CAP_NET_ADMIN; it does not thereby control the physical host firewall. These
+restrictions are enforced by PRoot detection and the running kernel capability,
+not by a distro label.
+
 ACCESS
-Default: http://127.0.0.1:5005 on the host itself.
+For firewall changes, run the utility as root with CAP_NET_ADMIN. The UI can run
+read-only without it. Default: http://127.0.0.1:5005 on the host itself.
 From your own computer, open an SSH tunnel (replace USER and SERVER):
   ssh -N -L 5005:127.0.0.1:5005 USER@SERVER
 Then open http://127.0.0.1:5005 on your computer and enter your PIN.
@@ -76,14 +120,16 @@ venv and saved state at their installed paths for native restoration.
 Exports and backups alone do not configure automatic restoration at boot.
 
 IMPORTANT
-This is a root-level administration tool. Rule edits and DROP policies can cut
-off SSH/network access. Export a backup and retain console access before edits.
+To change firewall rules, run as root with CAP_NET_ADMIN. Rule edits and DROP
+policies can cut off SSH/network access. Export a backup and retain console access before edits.
 Docker, libvirt and other tools can maintain their own rules. A four-digit PIN
 has only 10,000 combinations: use localhost/SSH tunneling, or place the UI behind
 HTTPS plus additional access controls. Do not expose it publicly with PIN alone.
 Never publish actual environment files, backups, exports, logs, or credentials.
 This archive contains examples only, with no personal server addresses or keys.
-If making the repository open source, choose and add your preferred LICENSE.
+The application code is MIT-licensed; see the included LICENSE file.
+Bundled fonts retain their separate upstream licenses in the installed
+font-licenses directory.
 
 TROUBLESHOOTING
 401: entered PIN differs from NFT_SECRET in the running service.

@@ -2,7 +2,9 @@
 """firewall_web - single-file mini firewall UI for Linux.
 
 Install in a virtual environment: pip install flask waitress
-Run as root with NFT_SECRET set to an access key of exactly four digits:
+Install and run as root with CAP_NET_ADMIN to change firewall rules. Without
+that kernel capability, the authenticated interface runs in read-only mode.
+Set NFT_SECRET to an access key of exactly four digits:
     sudo env NFT_SECRET='YOUR_FOUR_DIGIT_PIN' python3 firewall_web.py
 Open http://127.0.0.1:5005 or http://<machine-LAN-IP>:5005 and enter that key.
 
@@ -46,7 +48,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 
 
@@ -62,6 +64,16 @@ IPT_PLUGINS = (Path('/usr/share/netfilter-persistent/plugins.d/15-ip4tables'),
                Path('/usr/share/netfilter-persistent/plugins.d/25-ip6tables'))
 NATIVE_STATE = Path(os.environ.get('NFT_NATIVE_STATE', '/var/lib/nft-web/native-rules.json'))
 NATIVE_UNIT = Path('/etc/systemd/system/nft-web-restore.service')
+FONT_DIR = Path(__file__).with_name('fonts')
+FONT_ASSETS = {
+    'Hack-Regular.ttf': 'font/ttf',
+    'JetBrainsMono.woff2': 'font/woff2',
+    'FiraCode.woff2': 'font/woff2',
+    'SourceCodePro.woff2': 'font/woff2',
+    'CascadiaCode.woff2': 'font/woff2',
+    'IBMPlexMono.woff2': 'font/woff2',
+    'Inconsolata.woff2': 'font/woff2',
+}
 PATH = '/usr/sbin:/sbin:/usr/bin:/bin'
 LOCK = threading.RLock()
 TABLES = ('filter', 'nat', 'mangle', 'raw', 'security')
@@ -71,6 +83,37 @@ BACKENDS = {
     'iptables-legacy': 'iptables-legacy-save',
     'ip6tables-legacy': 'ip6tables-legacy-save',
 }
+
+
+def has_net_admin():
+    try:
+        for line in Path('/proc/self/status').read_text().splitlines():
+            if line.startswith('CapEff:'):
+                return bool(int(line.split()[1], 16) & (1 << 12))
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
+def is_proot():
+    return any(os.environ.get(name) for name in ('PROOT_TMP_DIR', 'PROOT_LOADER', 'PROOT_BARRIER'))
+
+
+def can_manage_firewall():
+    return os.geteuid() == 0 and has_net_admin() and not is_proot()
+
+
+def read_only_reason():
+    if is_proot():
+        return ('PRoot does not grant kernel firewall access. This interface is read-only '
+                'and cannot change the Android or host firewall.')
+    if os.geteuid() != 0:
+        return 'Run as root with CAP_NET_ADMIN to change firewall rules.'
+    if has_net_admin():
+        return ''
+    return ('Kernel CAP_NET_ADMIN is unavailable. Firewall changes are disabled. '
+            'Termux PRoot, unprivileged containers, and some userspace guests cannot '
+            'manage the host firewall.')
 
 
 class Problem(Exception):
@@ -462,7 +505,7 @@ def port_test_rules(state, remove, add):
 
 @app.before_request
 def authenticate():
-    if request.path == '/' and request.method == 'GET':
+    if request.method == 'GET' and (request.path == '/' or request.path.startswith('/fonts/')):
         return None
     if not re.fullmatch(r'[0-9]{4}', SECRET):
         raise Problem('Server requires NFT_SECRET with exactly four digits.', 503)
@@ -472,6 +515,8 @@ def authenticate():
     origin = request.headers.get('Origin')
     if origin and origin not in {request.host_url.rstrip('/'), *ALLOWED_ORIGINS}:
         raise Problem('Cross-origin requests are not allowed.', 403)
+    if request.method not in ('GET', 'HEAD', 'OPTIONS') and not can_manage_firewall():
+        raise Problem(read_only_reason(), 403)
 
 
 @app.after_request
@@ -506,6 +551,14 @@ def index():
     return Response(HTML, mimetype='text/html')
 
 
+@app.get('/fonts/<path:filename>')
+def font_asset(filename):
+    mimetype = FONT_ASSETS.get(filename)
+    if not mimetype:
+        raise Problem('Font not found.', 404)
+    return send_from_directory(FONT_DIR, filename, mimetype=mimetype, max_age=31536000)
+
+
 @app.get('/api/status')
 def status():
     installed = [n for n in BACKENDS if executable(n)]
@@ -516,6 +569,7 @@ def status():
             return None
     return jsonify(nft=bool(executable('nft')), backends=installed,
                    root=os.geteuid() == 0, interfaces=[n for _, n in socket.if_nameindex()],
+                   can_manage_firewall=can_manage_firewall(), read_only_reason=read_only_reason(),
                    forwarding={'ip': flag('/proc/sys/net/ipv4/ip_forward'),
                                'ip6': flag('/proc/sys/net/ipv6/conf/all/forwarding')})
 
@@ -873,7 +927,7 @@ HTML = r'''<!doctype html>
 <title>firewall_web | Mini firewall</title><style>
 :root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--line:#30363d;--muted:#919baa;--blue:#58a6ff;--green:#3fb950;--red:#ff7b72}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#d7dfe8;font:14px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
-main{max-width:1480px;margin:auto;padding:24px}h1{margin:0;color:var(--blue);font-size:25px}h2{font-size:15px;margin:0 0 14px}h3{font-size:13px;margin:0}p{margin:8px 0}.muted{color:var(--muted);font-size:12px}
+main{max-width:1480px;margin:auto;padding:24px}h1{margin:0;color:var(--blue);font-size:25px}h2{font-size:16px;margin:0 0 14px}h3{font-size:14px;margin:0}p{margin:8px 0}.muted{color:var(--muted);font-size:12px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:20px;margin:16px 0}.row{display:flex;align-items:end;flex-wrap:wrap;gap:10px}.between{justify-content:space-between;align-items:center}
 button,input,select,textarea{font:inherit;border:1px solid var(--line);border-radius:5px;padding:8px 10px;background:#0d1117;color:inherit}button{cursor:pointer;background:#21262d}button:hover{border-color:var(--blue)}button:disabled{opacity:.5;cursor:wait}button.primary{color:var(--blue);border-color:var(--blue)}button.danger{color:var(--red)}button.good{color:var(--green)}button:focus-visible,input:focus,textarea:focus,select:focus{outline:2px solid var(--blue);outline-offset:2px}
 label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:12px}input,select{min-width:100px;max-width:100%}textarea{width:100%;min-height:90px;resize:vertical}.wide{flex:1;min-width:240px}.small{width:110px}.hidden{display:none!important}
@@ -884,9 +938,45 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:650px;overflow:auto;f
 .checks{display:flex;gap:12px 24px;flex-wrap:wrap;padding:14px 0}.checks label{display:flex;flex-direction:row;align-items:center;gap:8px;font-size:13px;color:#d7dfe8}.checks input[type=checkbox]{appearance:auto;min-width:0;width:18px;height:18px;margin:0;accent-color:var(--blue);flex:none}.checks fieldset{border:0;margin:0;padding:0;display:flex;gap:18px;flex-wrap:wrap}.checks legend{font-size:11px;color:var(--muted);margin-bottom:8px}
 @media(max-width:820px){main{padding:16px}.app-shell{grid-template-columns:minmax(0,1fr);gap:0;margin-top:18px}.sidebar{display:none;position:fixed;left:0;top:0;bottom:0;z-index:51;width:250px;max-width:85vw;max-height:none;border-radius:0;border-top:0;border-bottom:0;border-left:0;padding:24px 12px}.sidebar-open .sidebar{display:block}.nav-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50}.sidebar-open .nav-backdrop{display:block}.menu-toggle{display:inline-flex;align-items:center;gap:8px;min-height:40px}.sidebar-close{display:block;width:100%;margin:20px 0 0;min-height:42px}.drawer-open{overflow:hidden}#page-title{font-size:20px}.toolbar{gap:12px}.toolbar-actions{width:100%;justify-content:space-between}.page-heading{align-items:flex-start}.menu-toggle{flex-shrink:0}}
 @media(max-width:600px){main{padding:12px}.card{padding:14px}input,select{width:100%}.row label{flex:1 1 130px;min-width:0}.row .wide{flex-basis:100%;min-width:0}h1{font-size:21px}.toolbar-actions label{flex:0 1 auto}.toolbar-actions select{width:auto}.toolbar-actions{gap:8px}.badge{font-size:11px;margin:2px}.page-heading{flex-wrap:wrap}.page-heading>div{flex:1;min-width:170px}}
+</style><style>
+:root{--text:#d7dfe8;--control-bg:#0d1117;--button-bg:#21262d;--sidebar-bg:#111720;--sidebar-text:#a6b1c0;--heading-text:#edf3fb;--nav-active-bg:#152a40;--nav-active-text:#b8dcff}
+:root[data-theme=light]{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#cbd2d9;--muted:#586575;--blue:#0969da;--green:#1a7f37;--red:#cf222e;--text:#1f2328;--control-bg:#fff;--button-bg:#f3f4f6;--sidebar-bg:#e9edf2;--sidebar-text:#3e4c5c;--heading-text:#1f2328;--nav-active-bg:#dbeafe;--nav-active-text:#084298}
+body{color:var(--text);font-size:var(--ui-font-size,14px)}
+button,input,select,textarea{background:var(--control-bg);color:var(--text)}
+button{background:var(--button-bg)}
+.sidebar{background:var(--sidebar-bg)}
+.sidebar-heading,.checks label{color:var(--text)}
+.tab{color:var(--sidebar-text)}
+.tab:hover{background:color-mix(in srgb,var(--blue) 10%,var(--sidebar-bg))}
+.tab.active{color:var(--nav-active-text);background:var(--nav-active-bg);border-color:color-mix(in srgb,var(--blue) 45%,var(--line))}
+#page-title{color:var(--heading-text)}
+body,button,input,select,textarea{font-family:var(--ui-font-family,ui-monospace,SFMono-Regular,Consolas,monospace)}
+.animation-setting{display:flex;flex-direction:row;align-items:center;gap:8px}
+.animation-setting input{min-width:0;width:16px;height:16px;accent-color:var(--blue)}
+.brand-cursor{animation:cursor-blink .8s steps(2,start) infinite}
+@keyframes cursor-blink{to{visibility:hidden}}
+@font-face{font-family:Hack;src:url('/fonts/Hack-Regular.ttf') format('truetype');font-style:normal;font-weight:400;font-display:swap}
+@font-face{font-family:'JetBrains Mono';src:url('/fonts/JetBrainsMono.woff2') format('woff2');font-style:normal;font-weight:400;font-display:swap}
+@font-face{font-family:'Fira Code';src:url('/fonts/FiraCode.woff2') format('woff2');font-style:normal;font-weight:400;font-display:swap}
+@font-face{font-family:'Source Code Pro';src:url('/fonts/SourceCodePro.woff2') format('woff2');font-style:normal;font-weight:400;font-display:swap}
+@font-face{font-family:'Cascadia Code';src:url('/fonts/CascadiaCode.woff2') format('woff2');font-style:normal;font-weight:400;font-display:swap}
+@font-face{font-family:'IBM Plex Mono';src:url('/fonts/IBMPlexMono.woff2') format('woff2');font-style:normal;font-weight:400;font-display:swap}
+@font-face{font-family:Inconsolata;src:url('/fonts/Inconsolata.woff2') format('woff2');font-style:normal;font-weight:400;font-display:swap}
+.setting-control{margin:10px 0 20px}
+.panel#display .setting-control>label,.panel#display .setting-control>h3{font-size:14px;font-weight:400}
+.site-credit{text-align:center;margin:48px 0 2px;padding:10px;font-size:9px;color:var(--muted)}
+.site-credit a{color:inherit;text-decoration:underline;text-underline-offset:2px}
+.setting-control input[type=range]{width:min(420px,100%);accent-color:var(--blue)}
+.color-control{display:flex;align-items:center;gap:12px}
+.color-control input[type=color]{width:56px;min-width:56px;max-width:56px;height:42px;padding:3px;cursor:pointer}
+.presets{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-top:12px}
+.preset{padding:10px;background:var(--control-bg);color:var(--text);border:1px solid var(--line);border-radius:8px;text-align:left}
+.preset-swatch{display:grid;place-items:center;height:62px;margin-bottom:8px;border:1px solid color-mix(in srgb,var(--text) 20%,transparent);border-radius:5px;font-size:30px;font-weight:700}
+.preset[aria-pressed=true]{outline:2px solid var(--blue);outline-offset:2px}
 </style></head><body><main>
-<div class="row between"><div><h1>firewall_web</h1><p class="muted">A mini firewall console | nftables / iptables / masquerade</p></div><span id="connection">Locked</span></div>
-<form class="card row" id="login"><label class="wide">4-digit PIN<input id="key" type="password" autocomplete="current-password" placeholder="Enter PIN" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" required></label><button class="primary">Unlock</button><span class="muted">The key stays in this page's memory.</span></form>
+<div class="row between"><div><h1 id="brand-title"><span id="brand-text">firewall_web</span><span class="brand-cursor" aria-hidden="true">_</span></h1><p class="muted"><strong>A mini firewall console | nftables / iptables / masquerade</strong></p></div><span id="connection">Locked</span></div>
+<p class="muted notice warning">To change firewall rules, this utility must be installed and run as root with CAP_NET_ADMIN. Termux PRoot and unprivileged userspace environments provide read-only UI only; PRoot cannot change the Android host firewall.</p>
+<form class="card row" id="login"><label class="wide">4-digit PIN<input id="key" type="password" autocomplete="current-password" placeholder="Enter PIN" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" required></label><button class="primary">Unlock</button><span class="muted">The key stays in this page's memory. The utility must run as root to administer the firewall.</span></form>
 <section id="app" class="hidden">
 <div class="app-shell">
 <aside id="sidebar" class="sidebar" aria-label="Firewall sections">
@@ -901,6 +991,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:650px;overflow:auto;f
 <button id="tab-persistence" role="tab" aria-selected="false" aria-controls="persistence" tabindex="-1" class="tab" data-tab="persistence"><span class="nav-index" aria-hidden="true">05</span>Persistence</button>
 <button id="tab-backups" role="tab" aria-selected="false" aria-controls="backups" tabindex="-1" class="tab" data-tab="backups"><span class="nav-index" aria-hidden="true">06</span>Backups</button>
 <button id="tab-advanced" role="tab" aria-selected="false" aria-controls="advanced" tabindex="-1" class="tab" data-tab="advanced"><span class="nav-index" aria-hidden="true">07</span>Advanced</button>
+<p class="nav-group" role="presentation">Personalization</p>
+<button id="tab-display" role="tab" aria-selected="false" aria-controls="display" tabindex="-1" class="tab" data-tab="display"><span class="nav-index" aria-hidden="true">08</span>Display and Feel</button>
 </nav>
 <div class="sidebar-footer"><strong>Live firewall</strong>Save edits in Persistence to restore them after boot.</div>
 <button id="sidebar-close" class="sidebar-close">Close menu</button>
@@ -908,20 +1000,20 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:650px;overflow:auto;f
 <div id="nav-backdrop" class="nav-backdrop" aria-hidden="true"></div>
 <div id="workspace" class="workspace">
 <header class="page-heading"><button id="menu-toggle" class="menu-toggle" aria-controls="sidebar" aria-expanded="false" aria-label="Open sections">Sections</button><div><h2 id="page-title">All Rules</h2><p id="page-description" class="muted">A complete view of the firewall backends installed on this machine.</p></div></header>
-<div class="row between toolbar"><div id="badges"></div><div class="row toolbar-actions"><button id="refresh" class="primary">Refresh</button><label>Auto-refresh<select id="auto"><option value="0">Off</option><option value="15">15 seconds</option><option value="30">30 seconds</option></select></label><button id="logout">Lock</button></div></div>
+<div class="row between toolbar"><div id="badges"></div><div class="row toolbar-actions"><button id="refresh" class="primary">Refresh</button><label>Auto-refresh<select id="auto"><option value="0">Off</option><option value="15">15 seconds</option><option value="30">30 seconds</option></select></label><button id="logout">Lock</button></div></div><p id="access-warning" class="muted notice warning hidden" role="status"></p>
 <section id="overview" class="panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0"><div class="card"><h2>All installed firewall views</h2><p class="muted">Full listings include all tables. iptables-nft overlaps with nftables; default and explicit backend commands may show the same rules. These are views, not independent rule totals.</p><div id="all-views"></div></div></section>
 <section id="nft" class="panel hidden" role="tabpanel" aria-labelledby="tab-nft" tabindex="0">
 <div class="card"><h2>nftables rules</h2><div class="row"><label class="wide">Search<input id="n-search" placeholder="Family, table, chain, expression or comment"></label><label>Filter<select id="n-filter"><option value="all">All rules</option><option value="masq">Masquerade only</option></select></label></div><div id="n-rules"></div><details><summary>Complete native ruleset | handles included</summary><pre id="n-raw"></pre></details></div>
-<form class="card" id="n-add"><h2>Add nftables rule</h2><div class="row"><label>Family<select name="family"><option>inet</option><option>ip</option><option>ip6</option><option>bridge</option><option>arp</option><option>netdev</option></select></label><label>Table<input name="table" value="filter" required></label><label>Chain<input name="chain" value="input" required></label><label>Position<select name="operation"><option value="add">Append</option><option value="insert">Insert first</option></select></label></div><label>Rule expression<textarea name="rule" placeholder="ct state established,related counter accept" required></textarea></label><p class="muted">Use existing tables/chains, or create one below. Names are case-sensitive.</p><button class="good">Add rule</button></form>
-<form class="card" id="n-chain"><h2>Create nftables table / chain</h2><div class="row"><label>Family<select name="family"><option>inet</option><option>ip</option><option>ip6</option></select></label><label>Table<input name="table" value="mini_firewall" required></label><label>Chain<input name="chain" value="input" required></label><label>Hook<select name="hook"><option value="">Regular chain (no hook)</option><option>input</option><option>output</option><option>forward</option><option>prerouting</option><option>postrouting</option></select></label><label>Type<select name="type"><option>filter</option><option>nat</option><option>route</option></select></label><label>Priority<input name="priority" type="number" value="0" class="small"></label><label>Policy<select name="policy"><option>accept</option><option>drop</option></select></label><button class="good">Create</button></div></form>
+<form class="card firewall-write-form" id="n-add"><h2>Add nftables rule</h2><div class="row"><label>Family<select name="family"><option>inet</option><option>ip</option><option>ip6</option><option>bridge</option><option>arp</option><option>netdev</option></select></label><label>Table<input name="table" value="filter" required></label><label>Chain<input name="chain" value="input" required></label><label>Position<select name="operation"><option value="add">Append</option><option value="insert">Insert first</option></select></label></div><label>Rule expression<textarea name="rule" placeholder="ct state established,related counter accept" required></textarea></label><p class="muted">Use existing tables/chains, or create one below. Names are case-sensitive.</p><button class="good">Add rule</button></form>
+<form class="card firewall-write-form" id="n-chain"><h2>Create nftables table / chain</h2><div class="row"><label>Family<select name="family"><option>inet</option><option>ip</option><option>ip6</option></select></label><label>Table<input name="table" value="mini_firewall" required></label><label>Chain<input name="chain" value="input" required></label><label>Hook<select name="hook"><option value="">Regular chain (no hook)</option><option>input</option><option>output</option><option>forward</option><option>prerouting</option><option>postrouting</option></select></label><label>Type<select name="type"><option>filter</option><option>nat</option><option>route</option></select></label><label>Priority<input name="priority" type="number" value="0" class="small"></label><label>Policy<select name="policy"><option>accept</option><option>drop</option></select></label><button class="good">Create</button></div></form>
 </section>
 <section id="ipt" class="panel hidden" role="tabpanel" aria-labelledby="tab-ipt" tabindex="0">
-<form class="card" id="i-port"><h2>Add a service port</h2><p class="muted">Allow an incoming TCP or UDP service and its replies. Select one IP family or both in a single submission.</p><div class="row"><label>Protocol<select name="protocol"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label><label>Port or range<input name="port" placeholder="e.g. 41641 or 8000:8010" required inputmode="text"></label><label>Backend mode<select name="mode"><option value="default">System default</option><option value="nft">iptables-nft</option><option value="legacy">iptables-legacy</option></select></label><label>Interface<select name="iface" id="p-iface"><option value="">Any interface</option></select></label></div><div class="checks"><fieldset><legend>IP families</legend><label><input id="p-ipv4" name="ipv4" type="checkbox" checked>IPv4</label><label><input id="p-ipv6" name="ipv6" type="checkbox" checked>IPv6</label></fieldset><fieldset><legend>Connection tracking</legend><label><input id="p-stateless" name="stateless" type="checkbox">Stateless (NOTRACK)</label></fieldset></div><p class="muted notice">Stateless is off by default: normal system connection tracking is used, as in a usual Debian setup. When enabled, raw-table NOTRACK rules bypass tracking for incoming traffic and replies. This is incompatible with NAT/masquerading for that traffic.</p><p class="muted">Rules are inserted first so earlier terminal filter rules do not hide this permit. Re-submitting the same port updates rules created by this form. Save in Persistence afterward to survive boot.</p><button class="good">Add / update port</button></form>
+<form class="card firewall-write-form" id="i-port"><h2>Add a service port</h2><p class="muted">Allow an incoming TCP or UDP service and its replies. Select one IP family or both in a single submission.</p><div class="row"><label>Protocol<select name="protocol"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label><label>Port or range<input name="port" placeholder="e.g. 41641 or 8000:8010" required inputmode="text"></label><label>Backend mode<select name="mode"><option value="default">System default</option><option value="nft">iptables-nft</option><option value="legacy">iptables-legacy</option></select></label><label>Interface<select name="iface" id="p-iface"><option value="">Any interface</option></select></label></div><div class="checks"><fieldset><legend>IP families</legend><label><input id="p-ipv4" name="ipv4" type="checkbox" checked>IPv4</label><label><input id="p-ipv6" name="ipv6" type="checkbox" checked>IPv6</label></fieldset><fieldset><legend>Connection tracking</legend><label><input id="p-stateless" name="stateless" type="checkbox">Stateless (NOTRACK)</label></fieldset></div><p class="muted notice">Stateless is off by default: normal system connection tracking is used, as in a usual Debian setup. When enabled, raw-table NOTRACK rules bypass tracking for incoming traffic and replies. This is incompatible with NAT/masquerading for that traffic.</p><p class="muted">Rules are inserted first so earlier terminal filter rules do not hide this permit. Re-submitting the same port updates rules created by this form. Save in Persistence afterward to survive boot.</p><button class="good">Add / update port</button></form>
 <div class="card"><h2>iptables rules</h2><div class="row"><label>Executable / backend<select id="i-backend"></select></label><label class="wide">Search<input id="i-search" placeholder="Table, chain, target or expression"></label><label>Filter<select id="i-filter"><option value="all">All rules</option><option value="masq">Masquerade only</option></select></label></div><p id="i-version" class="muted"></p><div id="i-rules"></div><details><summary>Complete save-format listing | all tables and counters</summary><pre id="i-raw"></pre></details></div>
-<form class="card" id="i-add"><h2>Add iptables rule | selected backend above</h2><div class="row"><label>Table<select name="table"><option>filter</option><option>nat</option><option>mangle</option><option>raw</option><option>security</option></select></label><label>Chain<input name="chain" value="INPUT" required></label><label>Position<select name="operation"><option value="append">Append</option><option value="insert">Insert</option></select></label><label>Insert at #<input name="position" type="number" min="1" value="1" class="small"></label></div><label>Match / target options<textarea name="rule" placeholder="-p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT" required></textarea></label><p class="muted">Do not include the executable, -A/-I, table or chain here.</p><button class="good">Add rule</button></form>
-<form class="card" id="i-chain"><h2>iptables chain / policy</h2><div class="row"><label>Table<select name="table"><option>filter</option><option>nat</option><option>mangle</option><option>raw</option><option>security</option></select></label><label>Chain<input name="chain" value="INPUT" required></label><label>Action<select name="action"><option value="create">Create user chain</option><option value="policy">Set built-in policy</option></select></label><label>Policy<select name="policy"><option>ACCEPT</option><option>DROP</option></select></label><button class="primary">Apply</button></div></form>
+<form class="card firewall-write-form" id="i-add"><h2>Add iptables rule | selected backend above</h2><div class="row"><label>Table<select name="table"><option>filter</option><option>nat</option><option>mangle</option><option>raw</option><option>security</option></select></label><label>Chain<input name="chain" value="INPUT" required></label><label>Position<select name="operation"><option value="append">Append</option><option value="insert">Insert</option></select></label><label>Insert at #<input name="position" type="number" min="1" value="1" class="small"></label></div><label>Match / target options<textarea name="rule" placeholder="-p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT" required></textarea></label><p class="muted">Do not include the executable, -A/-I, table or chain here.</p><button class="good">Add rule</button></form>
+<form class="card firewall-write-form" id="i-chain"><h2>iptables chain / policy</h2><div class="row"><label>Table<select name="table"><option>filter</option><option>nat</option><option>mangle</option><option>raw</option><option>security</option></select></label><label>Chain<input name="chain" value="INPUT" required></label><label>Action<select name="action"><option value="create">Create user chain</option><option value="policy">Set built-in policy</option></select></label><label>Policy<select name="policy"><option>ACCEPT</option><option>DROP</option></select></label><button class="primary">Apply</button></div></form>
 </section>
-<section id="masq" class="panel hidden" role="tabpanel" aria-labelledby="tab-masq" tabindex="0"><div class="card"><h2>Masquerade / source NAT</h2><p class="muted notice warning">NAT alone does not enable forwarding or allow forwarded traffic. Check forwarding status above. This control never flushes existing NAT rules.</p><form id="m-form"><div class="row"><label>Engine<select name="engine" id="m-engine"></select></label><label>nft family<select name="family"><option>ip</option><option>ip6</option></select></label><label>nft table<input name="table" value="nft_web_nat"></label><label>Outgoing interface<select name="iface" id="m-iface"></select></label><label class="wide">Source subnet (optional)<input name="source" placeholder="e.g. 192.168.200.0/24"></label></div><p class="muted">Blank interface/subnet means any. nftables uses a dedicated postrouting NAT chain. Enable is idempotent. Disable removes only nft-web-tagged rules matching these settings. Delete other existing masquerade rules from the rules lists.</p><div class="row"><button class="good" name="action" value="enable">Enable matching rule</button><button class="danger" name="action" value="disable">Disable matching rule</button></div></form></div></section>
+<section id="masq" class="panel hidden" role="tabpanel" aria-labelledby="tab-masq" tabindex="0"><div class="card"><h2>Masquerade / source NAT</h2><p class="muted notice warning">NAT alone does not enable forwarding or allow forwarded traffic. Check forwarding status above. This control never flushes existing NAT rules.</p><form id="m-form" class="firewall-write-form"><div class="row"><label>Engine<select name="engine" id="m-engine"></select></label><label>nft family<select name="family"><option>ip</option><option>ip6</option></select></label><label>nft table<input name="table" value="nft_web_nat"></label><label>Outgoing interface<select name="iface" id="m-iface"></select></label><label class="wide">Source subnet (optional)<input name="source" placeholder="e.g. 192.168.200.0/24"></label></div><p class="muted">Blank interface/subnet means any. nftables uses a dedicated postrouting NAT chain. Enable is idempotent. Disable removes only nft-web-tagged rules matching these settings. Delete other existing masquerade rules from the rules lists.</p><div class="row"><button class="good" name="action" value="enable">Enable matching rule</button><button class="danger" name="action" value="disable">Disable matching rule</button></div></form></div></section>
 <section id="persistence" class="panel hidden" role="tabpanel" aria-labelledby="tab-persistence" tabindex="0">
 <div class="card action-card"><h2>IPv4 + IPv6 boot persistence</h2><p>Save the current system-default iptables and ip6tables rules, including masquerading, and enable restoration after boot.</p><p class="muted">Uses netfilter-persistent and its IPv4/IPv6 plugins. Both saved files are validated. This saves the default backends, not all legacy/nft alternatives at once.</p><button id="persist-ipt" class="good">Persist IPv4 + IPv6</button></div>
 <div class="card action-card"><h2>Native nftables boot persistence</h2><p>Save native nftables tables and enable their dedicated boot restore service.</p><p class="muted">iptables-nft tables are excluded and use the IPv4 + IPv6 button above. Keep this script and its Python environment at their installed paths.</p><button id="persist-nft" class="good">Persist native nft</button></div>
@@ -931,25 +1023,53 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:650px;overflow:auto;f
 <div class="card action-card"><h2>Save a backup on this machine</h2><p>Capture every installed firewall view, including rule counters, into a protected server-side JSON file.</p><p class="muted">A backup is also made automatically before firewall changes.</p><button id="backup" class="primary">Save backup</button></div>
 <div class="card action-card"><h2>Download a backup</h2><p>Export the current firewall views as a JSON file for your own records.</p><p class="muted">Exports are snapshots, not automatically restored boot configurations.</p><button id="export" class="primary">Download backup</button></div>
 </section>
-<section id="advanced" class="panel hidden" role="tabpanel" aria-labelledby="tab-advanced" tabindex="0"><form class="card" id="raw-form"><h2>Advanced command</h2><p class="muted notice warning">This has full firewall access. Flushing rules or setting a DROP policy can disconnect SSH, containers or this UI. Export a backup first. No shell commands or file directives.</p><label>Executable<select id="raw-engine" name="engine"></select></label><label>Command<textarea name="cmd" placeholder="nft: list ruleset&#10;iptables: -t filter -S" required></textarea></label><div class="row"><label>Type RUN to execute<input name="confirm" placeholder="RUN" required autocomplete="off"></label><button class="danger">Run</button></div><pre id="raw-out">Output appears here.</pre></form></section>
+<section id="advanced" class="panel hidden" role="tabpanel" aria-labelledby="tab-advanced" tabindex="0"><form class="card firewall-write-form" id="raw-form"><h2>Advanced command</h2><p class="muted notice warning">This has full firewall access. Flushing rules or setting a DROP policy can disconnect SSH, containers or this UI. Export a backup first. No shell commands or file directives.</p><label>Executable<select id="raw-engine" name="engine"></select></label><label>Command<textarea name="cmd" placeholder="nft: list ruleset&#10;iptables: -t filter -S" required></textarea></label><div class="row"><label>Type RUN to execute<input name="confirm" placeholder="RUN" required autocomplete="off"></label><button class="danger">Run</button></div><pre id="raw-out">Output appears here.</pre></form></section>
+<section id="display" class="panel hidden" role="tabpanel" aria-labelledby="tab-display" tabindex="0">
+<div class="card"><h2>Display and Feel</h2><p class="muted">Personal appearance settings are saved in this browser.</p>
+<div class="setting-control"><label for="theme-select">Color theme</label><select id="theme-select"><option value="system">System default</option><option value="dark">Dark</option><option value="light">Light</option></select></div>
+<div class="setting-control"><label class="animation-setting"><input id="header-animation" type="checkbox" checked>Animate header</label></div>
+<div class="setting-control"><label for="font-size">Font size: <output id="font-size-value">14px</output></label><input id="font-size" type="range" min="12" max="20" step="1" value="14"></div>
+<div class="setting-control"><label for="font-family">Bundled font family</label><select id="font-family"><option value="JetBrains Mono,ui-monospace,monospace">JetBrains Mono</option><option value="Hack,ui-monospace,monospace">Hack</option><option value="Fira Code,ui-monospace,monospace">Fira Code</option><option value="Source Code Pro,ui-monospace,monospace">Source Code Pro</option><option value="Cascadia Code,ui-monospace,monospace">Cascadia Code</option><option value="IBM Plex Mono,ui-monospace,monospace">IBM Plex Mono</option><option value="Inconsolata,ui-monospace,monospace">Inconsolata</option></select></div>
+<div class="setting-control"><label for="background-color">Background color</label><div class="color-control"><input id="background-color" type="color" value="#0d1117"><span class="muted">Choose a custom page background.</span></div></div>
+<div class="setting-control"><label for="font-color">Font color</label><div class="color-control"><input id="font-color" type="color" value="#d7dfe8"><span class="muted">Choose the primary text color.</span></div></div>
+<div class="setting-control"><h3>Quick looks</h3><p class="muted">Choose from six curated palettes, three light and three dark.</p><div id="appearance-presets" class="presets"></div></div>
+</div></section>
 <p id="updated" class="muted"></p></div></div></section><div id="toast" class="hidden" role="status"></div>
+<footer class="site-credit"><em>Created &amp; Conceptualized by <a href="https://github.com/arslandevpk/firewall-web" target="_blank" rel="noopener noreferrer">arslandevpk</a></em></footer>
 </main><script>
 'use strict';
-const $=id=>document.getElementById(id);let key='',status={},snapshot=null,nft=null,ipt=null,busy=false,refreshing=false,timer=null;
+const $=id=>document.getElementById(id);let key='',status={},snapshot=null,nft=null,ipt=null,busy=false,refreshing=false,timer=null,firewallWritable=false;
 function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e}
+const appearanceKey='firewall-web-appearance';
+const fontFamilies=['JetBrains Mono,ui-monospace,monospace','Hack,ui-monospace,monospace','Fira Code,ui-monospace,monospace','Source Code Pro,ui-monospace,monospace','Cascadia Code,ui-monospace,monospace','IBM Plex Mono,ui-monospace,monospace','Inconsolata,ui-monospace,monospace'];
+const colorPresets=[
+{name:'Paper',theme:'light',bg:'#f4f6f8',text:'#1f2328'},
+{name:'Warm Sand',theme:'light',bg:'#f5efe6',text:'#332719'},
+{name:'Soft Mint',theme:'light',bg:'#eaf4ef',text:'#18352a'},
+{name:'Midnight',theme:'dark',bg:'#0d1117',text:'#d7dfe8'},
+{name:'Deep Ocean',theme:'dark',bg:'#0a1929',text:'#d5e8ff'},
+{name:'Forest',theme:'dark',bg:'#102019',text:'#d7eee0'}];
+let appearance={theme:'system',font:fontFamilies[0],size:14,bg:'',text:'',animate:!matchMedia('(prefers-reduced-motion: reduce)').matches};
+try{const saved=JSON.parse(localStorage.getItem(appearanceKey)||'{}');if(['system','light','dark'].includes(saved.theme))appearance.theme=saved.theme;if(fontFamilies.includes(saved.font))appearance.font=saved.font;if(Number.isInteger(saved.size)&&saved.size>=12&&saved.size<=20)appearance.size=saved.size;if(typeof saved.bg==='string'&&/^#[0-9a-f]{6}$/i.test(saved.bg))appearance.bg=saved.bg;if(typeof saved.text==='string'&&/^#[0-9a-f]{6}$/i.test(saved.text))appearance.text=saved.text;if(typeof saved.animate==='boolean')appearance.animate=saved.animate}catch(error){console.warn('Could not load saved appearance settings:',error)}
+function applyAppearance(save=true){const root=document.documentElement;const effective=appearance.theme==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):appearance.theme;root.dataset.theme=effective;root.style.setProperty('--ui-font-family',appearance.font);root.style.setProperty('--ui-font-size',appearance.size+'px');if(appearance.bg)root.style.setProperty('--bg',appearance.bg);else root.style.removeProperty('--bg');if(appearance.text)root.style.setProperty('--text',appearance.text);else root.style.removeProperty('--text');$('theme-select').value=appearance.theme;$('font-family').value=appearance.font;$('font-size').value=appearance.size;$('font-size-value').textContent=appearance.size+'px';$('background-color').value=appearance.bg|| (effective==='dark'?'#0d1117':'#f4f6f8');$('font-color').value=appearance.text|| (effective==='dark'?'#d7dfe8':'#1f2328');$('header-animation').checked=appearance.animate;for(const button of document.querySelectorAll('.preset'))button.setAttribute('aria-pressed',String(colorPresets.some(p=>p.name===button.dataset.preset&&p.theme===appearance.theme&&p.bg===appearance.bg&&p.text===appearance.text)));if(save){try{localStorage.setItem(appearanceKey,JSON.stringify(appearance))}catch(error){notice('Appearance updated but could not be saved in this browser: '+error.message,true)}}}
+function initAppearance(){const holder=$('appearance-presets');for(const preset of colorPresets){const button=el('button',undefined,'preset');button.type='button';button.dataset.preset=preset.name;button.setAttribute('aria-pressed','false');const swatch=el('span','A','preset-swatch');swatch.style.background=preset.bg;swatch.style.color=preset.text;button.append(swatch,el('span',preset.name+' · '+preset.theme));button.onclick=()=>{appearance.theme=preset.theme;appearance.bg=preset.bg;appearance.text=preset.text;applyAppearance()};holder.append(button)}$('theme-select').onchange=()=>{appearance.theme=$('theme-select').value;applyAppearance()};$('font-family').onchange=()=>{appearance.font=$('font-family').value;applyAppearance()};$('font-size').oninput=()=>{appearance.size=Number($('font-size').value);applyAppearance()};$('background-color').oninput=()=>{appearance.bg=$('background-color').value;applyAppearance()};$('font-color').oninput=()=>{appearance.text=$('font-color').value;applyAppearance()};$('header-animation').onchange=()=>{appearance.animate=$('header-animation').checked;applyAppearance();setHeaderAnimation(appearance.animate)};matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(appearance.theme==='system')applyAppearance(false)});applyAppearance(false);setHeaderAnimation(appearance.animate)}
+let headerTimer=null;
+function setHeaderAnimation(enabled){clearTimeout(headerTimer);const text=$('brand-text'),full='firewall_web';let index=enabled?0:full.length,deleting=false;text.textContent=full.slice(0,index);if(!enabled)return;function type(){index++;text.textContent=full.slice(0,index);if(index===full.length){deleting=true;headerTimer=setTimeout(erase,1000)}else headerTimer=setTimeout(type,130)}function erase(){index--;text.textContent=full.slice(0,index);if(index===0){deleting=false;headerTimer=setTimeout(type,350)}else headerTimer=setTimeout(erase,95)}headerTimer=setTimeout(type,350)}
 function notice(message,error=false){const t=$('toast');t.textContent=message;t.className=error?'error':'';clearTimeout(t._timer);t._timer=setTimeout(()=>t.classList.add('hidden'),error?12000:5005)}
 async function api(path,method='GET',body=null){const r=await fetch(path,{method,headers:{'Content-Type':'application/json','X-Secret':key},body:body===null?null:JSON.stringify(body),cache:'no-store'});let d;try{d=await r.json()}catch{throw Error('Server returned an invalid response ('+r.status+').')}if(!r.ok||d.error)throw Error(d.error||'HTTP '+r.status);return d}
 function values(form){return Object.fromEntries(new FormData(form).entries())}
 function options(node,items){const old=node.value;node.replaceChildren();for(const [value,label] of items){const o=el('option',label);o.value=value;node.append(o)}if(items.some(x=>x[0]===old))node.value=old}
-async function change(path,method,body){if(busy)return;busy=true;$('app').setAttribute('aria-busy','true');try{const r=await api(path,method,body);notice((r.message||'Change applied.')+(r.backup?' Backup: '+r.backup:''));await refresh(true);return r}catch(e){notice(e.message,true)}finally{busy=false;$('app').setAttribute('aria-busy','false')}}
+function setFirewallWritable(allowed,reason=''){firewallWritable=allowed;for(const form of document.querySelectorAll('.firewall-write-form'))for(const control of form.elements)control.disabled=!allowed;for(const id of ['persist-ipt','persist-nft','backup'])$(id).disabled=!allowed;$('access-warning').textContent=reason;$('access-warning').classList.toggle('hidden',allowed)}
+async function change(path,method,body){if(!firewallWritable){notice(status.read_only_reason||'Firewall changes are disabled without CAP_NET_ADMIN.',true);return}if(busy)return;busy=true;$('app').setAttribute('aria-busy','true');try{const r=await api(path,method,body);notice((r.message||'Change applied.')+(r.backup?' Backup: '+r.backup:''));await refresh(true);return r}catch(e){notice(e.message,true)}finally{busy=false;$('app').setAttribute('aria-busy','false')}}
 function display(expr){if(expr===null)return '';if(typeof expr!=='object')return String(expr);if(Array.isArray(expr))return expr.map(display).join(', ');if(expr.payload)return expr.payload.protocol+' '+expr.payload.field;if(expr.meta)return 'meta '+expr.meta.key;if(expr.ct)return 'ct '+expr.ct.key;if(expr.prefix)return expr.prefix.addr+'/'+expr.prefix.len;if(expr.set)return '{ '+display(expr.set)+' }';if(expr.range)return expr.range.map(display).join('-');if(expr.match){const m=expr.match;return display(m.left)+' '+(m.op==='=='?'':m.op+' ')+display(m.right)}if(expr.counter)return 'counter packets '+(expr.counter.packets||0)+' bytes '+(expr.counter.bytes||0);for(const k of ['accept','drop','return','continue','masquerade'])if(k in expr)return k+(expr[k]?' '+JSON.stringify(expr[k]):'');for(const k of ['jump','goto'])if(expr[k])return k+' '+expr[k].target;return JSON.stringify(expr)}
-function ruleTable(rules,isNft){const table=el('table',undefined,'rules');const head=el('tr');for(const h of isNft?['Handle','Expression / comment','Action']:['#','Packets / bytes','Rule options','Action'])head.append(el('th',h));table.append(head);for(const r of rules){const row=el('tr');row.append(el('td',String(isNft?r.handle:r.number)));if(!isNft)row.append(el('td',r.packets+' / '+r.bytes));row.append(el('td',isNft?r.expr.map(display).join(' ')+(r.comment?' | comment '+r.comment:''):r.expression,'expr'));const cell=el('td'),button=el('button','Delete','danger');button.onclick=()=>{if(!confirm('Delete this exact rule?\n'+(isNft?r.expr.map(display).join(' '):r.expression)))return;change(isNft?'/api/nft/rule':'/api/iptables/rule','DELETE',isNft?{family:r.family,table:r.table,chain:r.chain,handle:r.handle,token:r.token}:{backend:ipt.backend,table:r.table,chain:r.chain,token:r.token})};cell.append(button);row.append(cell);table.append(row)}return table}
+function ruleTable(rules,isNft){const table=el('table',undefined,'rules');const head=el('tr');for(const h of isNft?['Handle','Expression / comment','Action']:['#','Packets / bytes','Rule options','Action'])head.append(el('th',h));table.append(head);for(const r of rules){const row=el('tr');row.append(el('td',String(isNft?r.handle:r.number)));if(!isNft)row.append(el('td',r.packets+' / '+r.bytes));row.append(el('td',isNft?r.expr.map(display).join(' ')+(r.comment?' | comment '+r.comment:''):r.expression,'expr'));const cell=el('td'),button=el('button','Delete','danger');button.disabled=!firewallWritable;button.onclick=()=>{if(!firewallWritable)return;if(!confirm('Delete this exact rule?\n'+(isNft?r.expr.map(display).join(' '):r.expression)))return;change(isNft?'/api/nft/rule':'/api/iptables/rule','DELETE',isNft?{family:r.family,table:r.table,chain:r.chain,handle:r.handle,token:r.token}:{backend:ipt.backend,table:r.table,chain:r.chain,token:r.token})};cell.append(button);row.append(cell)}return table}
 function renderRules(state,isNft){const prefix=isNft?'n':'i',holder=$(prefix+'-rules');holder.replaceChildren();if(!state||state.error){holder.append(el('p',state?.error||'Backend unavailable.','muted'));$(prefix+'-raw').textContent=state?.error||'';return}const query=$(prefix+'-search').value.toLowerCase(),onlyMasq=$(prefix+'-filter').value==='masq';$(prefix+'-raw').textContent=state.raw||'(empty ruleset)';if(!isNft)$('i-version').textContent=state.version+' | IPv'+(state.backend.startsWith('ip6')?'6':'4');for(const c of state.chains){const f=isNft?c.family+' ':'';let rows=state.rules.filter(r=>r.table===c.table&&r.chain===c.name&&(!isNft||r.family===c.family));rows=rows.filter(r=>(!onlyMasq||r.masquerade)&&JSON.stringify(r).toLowerCase().includes(query));if((query||onlyMasq)&&!rows.length)continue;const details=el('details');details.open=true;const info=f+c.table+' / '+c.name+' | '+rows.length+' rules'+(c.policy?' | policy '+c.policy:'')+(c.hook?' | '+c.type+' / '+c.hook+' / priority '+c.prio:'');details.append(el('summary',info));const scroll=el('div',undefined,'scroll');scroll.append(rows.length?ruleTable(rows,isNft):el('p','No rules in this chain.','muted'));details.append(scroll);holder.append(details)}if(!state.chains.length)holder.append(el('p','No tables/chains in this view.','muted'))}
 function overviewView(){const host=$('all-views');host.replaceChildren();for(const [name,state]of Object.entries(snapshot.states)){const d=el('details');d.append(el('summary',name+' | '+(state.error?'unavailable':state.rules.length+' rules / '+state.chains.length+' chains')+(state.version?' | '+state.version:'')));d.append(el('pre',state.error||state.raw||'(empty ruleset)'));host.append(d)}if(!host.children.length)host.append(el('p','No firewall executables found. Install nftables and/or iptables on the target host.','muted'))}
 async function refresh(force=false){if(refreshing||(busy&&!force)||!key)return;refreshing=true;try{snapshot=await api('/api/overview');nft=snapshot.states.nft;ipt=snapshot.states[$('i-backend').value];overviewView();renderRules(nft,true);renderRules(ipt,false);$('updated').textContent='Last refreshed '+new Date().toLocaleString()+' | Rule counters are snapshots.'}finally{refreshing=false}}
-$('login').onsubmit=async e=>{e.preventDefault();key=$('key').value;try{status=await api('/api/status');$('key').value='';$('app').classList.remove('hidden');$('login').classList.add('hidden');$('connection').textContent='Unlocked | '+(status.root?'root':'not root - writes may fail');options($('i-backend'),status.backends.map(n=>[n,n]));const engines=[...(status.nft?[['nft','nftables']]:[]),...status.backends.map(n=>[n,n])];options($('m-engine'),engines);options($('raw-engine'),engines);options($('m-iface'),[['','Any interface'],...status.interfaces.filter(n=>n!=='lo').map(n=>[n,n])]);options($('p-iface'),[['','Any interface'],...status.interfaces.map(n=>[n,n])]);$('badges').replaceChildren();for(const [label,value]of [['IPv4 forwarding',status.forwarding.ip],['IPv6 forwarding',status.forwarding.ip6]])$('badges').append(el('span',label+': '+(value===null?'unknown':value?'on':'off'),'badge'));await refresh()}catch(err){key='';notice(err.message,true)}};
+$('login').onsubmit=async e=>{e.preventDefault();key=$('key').value;try{status=await api('/api/status');$('key').value='';$('app').classList.remove('hidden');$('login').classList.add('hidden');setFirewallWritable(status.can_manage_firewall===true,status.read_only_reason||'');$('connection').textContent='Unlocked | '+(status.can_manage_firewall?'firewall access':'read-only');options($('i-backend'),status.backends.map(n=>[n,n]));const engines=[...(status.nft?[['nft','nftables']]:[]),...status.backends.map(n=>[n,n])];options($('m-engine'),engines);options($('raw-engine'),engines);options($('m-iface'),[['','Any interface'],...status.interfaces.filter(n=>n!=='lo').map(n=>[n,n])]);options($('p-iface'),[['','Any interface'],...status.interfaces.map(n=>[n,n])]);$('badges').replaceChildren();for(const [label,value]of [['IPv4 forwarding',status.forwarding.ip],['IPv6 forwarding',status.forwarding.ip6]])$('badges').append(el('span',label+': '+(value===null?'unknown':value?'on':'off'),'badge'));await refresh()}catch(err){key='';notice(err.message,true)}};
 $('logout').onclick=()=>{setSidebar(false,false);key='';snapshot=nft=ipt=null;$('app').classList.add('hidden');$('login').classList.remove('hidden');$('connection').textContent='Locked';clearInterval(timer);$('auto').value='0';$('all-views').replaceChildren();$('n-rules').replaceChildren();$('i-rules').replaceChildren();$('n-raw').textContent='';$('i-raw').textContent='';$('raw-out').textContent='Output appears here.';$('key').focus()};
 const sectionInfo={overview:['All Rules','A complete view of the firewall backends installed on this machine.'],nft:['nftables','Inspect native tables and chains, then add or remove individual rules.'],ipt:['iptables','Manage IPv4 and IPv6 rules using the backend you select.'],masq:['Masquerade','Configure source NAT for an outgoing interface and subnet.'],persistence:['Persistence','Save firewall changes and enable their restoration after boot.'],backups:['Backups','Keep a protected snapshot on the server or download your own copy.'],advanced:['Advanced','Run an explicit firewall command when you need more control.']};
+sectionInfo.display=['Display and Feel','Personalize theme, font, text size, and colors in this browser.'];
 const mobileNav=window.matchMedia('(max-width:820px)');
 function setSidebar(open,restoreFocus=true){open=Boolean(open&&mobileNav.matches);const wasOpen=$('app').classList.contains('sidebar-open');$('app').classList.toggle('sidebar-open',open);document.body.classList.toggle('drawer-open',open);$('workspace').inert=open;$('menu-toggle').setAttribute('aria-expanded',String(open));$('menu-toggle').setAttribute('aria-label',open?'Close sections':'Open sections');if(open)document.querySelector('.tab.active').focus();else if(wasOpen&&restoreFocus)$('menu-toggle').focus()}
 function activateTab(id,closeMenu=true){if(!Object.hasOwn(sectionInfo,id))id='overview';for(const b of document.querySelectorAll('.tab')){const selected=b.dataset.tab===id;b.classList.toggle('active',selected);b.setAttribute('aria-selected',String(selected));b.tabIndex=selected?0:-1}for(const p of document.querySelectorAll('.panel'))p.classList.toggle('hidden',p.id!==id);$('page-title').textContent=sectionInfo[id][0];$('page-description').textContent=sectionInfo[id][1];history.replaceState(null,'','#'+id);const wasOpen=$('app').classList.contains('sidebar-open');if(closeMenu){setSidebar(false,false);if(wasOpen)$(id).focus({preventScroll:true})}}
@@ -957,7 +1077,7 @@ const navigationTabs=Array.from(document.querySelectorAll('.tab'));
 for(const [i,b]of navigationTabs.entries()){b.onclick=()=>activateTab(b.dataset.tab);b.onkeydown=e=>{let next=null;if(e.key==='ArrowDown')next=(i+1)%navigationTabs.length;if(e.key==='ArrowUp')next=(i+navigationTabs.length-1)%navigationTabs.length;if(e.key==='Home')next=0;if(e.key==='End')next=navigationTabs.length-1;if(next!==null){e.preventDefault();activateTab(navigationTabs[next].dataset.tab,false);navigationTabs[next].focus()}}}
 $('menu-toggle').onclick=()=>setSidebar(!$('app').classList.contains('sidebar-open'));$('sidebar-close').onclick=()=>setSidebar(false);$('nav-backdrop').onclick=()=>setSidebar(false);mobileNav.addEventListener('change',()=>setSidebar(false,false));
 document.addEventListener('keydown',e=>{if(!$('app').classList.contains('sidebar-open'))return;if(e.key==='Escape'){e.preventDefault();setSidebar(false)}else if(e.key==='Tab'){const first=document.querySelector('.tab.active'),last=$('sidebar-close');if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}}});
-window.addEventListener('hashchange',()=>activateTab(location.hash.slice(1),false));activateTab(location.hash.slice(1),false);
+window.addEventListener('hashchange',()=>activateTab(location.hash.slice(1),false));activateTab(location.hash.slice(1),false);initAppearance();
 $('refresh').onclick=()=>refresh().catch(e=>notice(e.message,true));$('auto').onchange=()=>{clearInterval(timer);if(+$('auto').value)timer=setInterval(()=>{if(!document.hidden&&!busy)refresh().catch(e=>notice(e.message,true))},+$('auto').value*1000)};
 for(const id of ['n-search','n-filter'])$(id).addEventListener('input',()=>renderRules(nft,true));for(const id of ['i-search','i-filter'])$(id).addEventListener('input',()=>renderRules(ipt,false));$('i-backend').onchange=()=>{ipt=snapshot?.states[$('i-backend').value];renderRules(ipt,false)};
 for(const [id,path]of [['n-add','/api/nft/rule'],['n-chain','/api/nft/chain'],['i-add','/api/iptables/rule'],['i-chain','/api/iptables/chain']])$(id).onsubmit=e=>{e.preventDefault();const d=values(e.currentTarget);if(id.startsWith('i-'))d.backend=$('i-backend').value;if((d.policy==='DROP'||d.policy==='drop')&&!confirm('A DROP policy can disconnect remote access. Continue?'))return;change(path,'POST',d)};
@@ -971,6 +1091,8 @@ $('persist-nft').onclick=()=>{if(confirm('Save current native nftables tables an
 
 if __name__ == '__main__':
     if sys.argv[1:] == ['--restore-native']:
+        if not can_manage_firewall():
+            raise SystemExit('Native firewall restore requires root with CAP_NET_ADMIN.')
         try:
             restore_native()
         except Exception as exc:
@@ -978,11 +1100,10 @@ if __name__ == '__main__':
         raise SystemExit(0)
     if not re.fullmatch(r'[0-9]{4}', SECRET):
         raise SystemExit('Set NFT_SECRET to an access key of exactly four digits. No default key is accepted.')
-    if os.geteuid() != 0:
-        raise SystemExit('Run as root (or adapt privileges explicitly); firewall access requires CAP_NET_ADMIN.')
     try:
         from waitress import serve
     except ImportError:
         raise SystemExit('Install dependencies first: pip install flask waitress')
-    print(f'[firewall_web] Listening on {HOST}:{PORT}; access key required. Use persistence buttons to save for boot.')
+    mode = 'firewall access' if can_manage_firewall() else 'read-only (' + read_only_reason() + ')'
+    print(f'[firewall_web] Listening on {HOST}:{PORT}; {mode}.')
     serve(app, host=HOST, port=PORT, threads=4)

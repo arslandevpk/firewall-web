@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+
+name="firewall-web"
+description="Root firewall management web console"
+command="/usr/bin/firewall-web"
+command_args=""
+command_background="yes"
+pidfile="/run/firewall-web.pid"
+directory="/usr/lib/firewall-web"
+
+depend() {
+	need net
+}
+
+start_pre() {
+	[ "$(id -u)" -eq 0 ] || eerror "firewall-web must run as root"
+	[ -r /etc/conf.d/firewall-web ] || eerror "Missing /etc/conf.d/firewall-web"
+	. /etc/conf.d/firewall-web
+	[ -n "$NFT_SECRET" ] || eerror "Set NFT_SECRET in /etc/conf.d/firewall-web"
+	export NFT_SECRET NFT_HOST NFT_PORT NFT_ALLOWED_ORIGINS NFT_BACKUP_DIR NFT_NATIVE_STATE
+}

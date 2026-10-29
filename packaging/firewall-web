@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+config=/etc/firewall-web/firewall-web.env
+if [ ! -r "$config" ] && [ -r /etc/conf.d/firewall-web ]; then
+	config=/etc/conf.d/firewall-web
+fi
+[ -r "$config" ] || { echo "Missing firewall-web configuration: $config" >&2; exit 1; }
+set -a
+. "$config"
+set +a
+exec /usr/bin/python3 /usr/lib/firewall-web/firewall_web.py "$@"

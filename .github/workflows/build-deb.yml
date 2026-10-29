@@ -1,4 +1,4 @@
-name: Build Debian packages
+name: Build Debian and Alpine packages
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       version:
         description: Debian package version (for example, 1.2.3)
         required: true
-        default: "1.0.0"
+        default: "1.0.2"
         type: string
 
 permissions:
@@ -19,7 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ubuntu-latest
             architecture: amd64
           - runner: ubuntu-24.04-arm
             architecture: arm64
@@ -56,9 +56,110 @@ jobs:
             http://127.0.0.1:5005/api/status |
             python3 -c 'import json,sys; status=json.load(sys.stdin); assert status["root"] is True; print("Service responds as root; detected nftables:", status["nft"])'
           sudo systemctl is-active --quiet firewall-web.service
+      - name: Test package in latest Ubuntu and Debian userspaces
+        env:
+          PACKAGE_ARCHITECTURE: ${{ matrix.architecture }}
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          package="$PWD/dist/firewall-web_${PACKAGE_VERSION}_${PACKAGE_ARCHITECTURE}.deb"
+          for image in ubuntu:latest debian:stable-slim; do
+            docker run --rm --network host \
+              -v "$PWD:/repo" \
+              -v "$package:/tmp/firewall-web.deb:ro" \
+              "$image" sh -ec '
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/firewall-web.deb
+                sed -i "s/^NFT_SECRET=.*/NFT_SECRET=1234/" /etc/firewall-web/firewall-web.env
+                sed -i "s/^NFT_PORT=.*/NFT_PORT=5505/" /etc/firewall-web/firewall-web.env
+                firewall-web >/tmp/firewall-web.log 2>&1 &
+                server=$!
+                trap "kill $server 2>/dev/null || true" EXIT
+                python3 /repo/packaging/test-readonly-http.py
+              '
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: firewall-web_${{ inputs.version }}_${{ matrix.architecture }}
           path: dist/firewall-web_${{ inputs.version }}_${{ matrix.architecture }}.deb
+          if-no-files-found: error
+          retention-days: 30
+
+  alpine:
+    name: Build and test Alpine ${{ matrix.apk_arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            apk_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            apk_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build APK and test on latest Alpine
+        env:
+          APK_ARCH: ${{ matrix.apk_arch }}
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          docker run --rm -e PACKAGE_VERSION -e APK_ARCH \
+            -v "$PWD:/repo" -w /repo alpine:latest \
+            sh -ec 'packaging/build-apk.sh "$PACKAGE_VERSION" "$APK_ARCH"'
+          package="$PWD/dist/firewall-web_${PACKAGE_VERSION}_${APK_ARCH}.apk"
+          docker run --rm --network host \
+            -v "$PWD:/repo" \
+            -v "$package:/tmp/firewall-web.apk:ro" \
+            alpine:latest sh -ec '
+              apk add --allow-untrusted --no-cache /tmp/firewall-web.apk
+              sed -i "s/^NFT_SECRET=.*/NFT_SECRET=1234/" /etc/conf.d/firewall-web
+              sed -i "s/^NFT_PORT=.*/NFT_PORT=5505/" /etc/conf.d/firewall-web
+              firewall-web >/tmp/firewall-web.log 2>&1 &
+              server=$!
+              trap "kill $server 2>/dev/null || true" EXIT
+              python3 /repo/packaging/test-readonly-http.py
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firewall-web_${{ inputs.version }}_${{ matrix.apk_arch }}
+          path: dist/firewall-web_${{ inputs.version }}_${{ matrix.apk_arch }}.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  debian-source:
+    name: Verify Debian source package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential debhelper lintian
+      - name: Build source and binary packages
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: packaging/build-source-deb.sh "$PACKAGE_VERSION"
+      - name: Run Lintian
+        run: lintian --fail-on error dist/source/*.dsc dist/source/*.deb
+      - name: Verify source package on current Debian stable
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          docker run --rm -e PACKAGE_VERSION -e DEBIAN_FRONTEND=noninteractive \
+            -v "$PWD:/repo" -w /repo debian:stable-slim sh -ec '
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential debhelper lintian
+              packaging/build-source-deb.sh "$PACKAGE_VERSION"
+              lintian --fail-on error dist/source/*.dsc dist/source/*.deb
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firewall-web-debian-source
+          path: |
+            dist/source/*.dsc
+            dist/source/*.orig.tar.gz
+            dist/source/*.debian.tar.xz
+            dist/source/*.buildinfo
+            dist/source/*.changes
+            dist/source/*.deb
           if-no-files-found: error
           retention-days: 30

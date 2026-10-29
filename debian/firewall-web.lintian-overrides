@@ -1,0 +1,6 @@
+# Bundled copy is served by the UI for offline font selection; its license is included.
+firewall-web: duplicate-font-file
+# The environment file can contain the authentication PIN and is intentionally private.
+firewall-web: non-standard-file-perm
+# This is the first proposed Debian package; there are no Debian BTS bugs to close.
+firewall-web: initial-upload-closes-no-bugs

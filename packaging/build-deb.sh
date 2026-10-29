@@ -27,14 +27,21 @@ package_dir="$work_dir/firewall-web"
 install -d -m 755 \
   "$package_dir/DEBIAN" \
   "$package_dir/usr/lib/firewall-web" \
+  "$package_dir/usr/lib/firewall-web/fonts/licenses" \
+  "$package_dir/usr/bin" \
   "$package_dir/usr/lib/systemd/system" \
   "$package_dir/etc/firewall-web" \
   "$package_dir/usr/share/doc/firewall-web"
 install -m 644 "$app_dir/firewall_web.py" "$package_dir/usr/lib/firewall-web/"
+install -m 644 "$app_dir"/fonts/*.woff2 "$app_dir"/fonts/*.ttf "$package_dir/usr/lib/firewall-web/fonts/"
+install -m 644 "$app_dir"/fonts/licenses/* "$package_dir/usr/lib/firewall-web/fonts/licenses/"
+install -m 755 "$script_dir/firewall-web" "$package_dir/usr/bin/firewall-web"
 install -m 644 "$app_dir/firewall-web.env.example" "$package_dir/etc/firewall-web/firewall-web.env"
 chmod 600 "$package_dir/etc/firewall-web/firewall-web.env"
 install -m 644 "$script_dir/firewall-web.service" "$package_dir/usr/lib/systemd/system/firewall-web.service"
 install -m 644 "$app_dir/README.txt" "$package_dir/usr/share/doc/firewall-web/README"
+install -m 644 "$repo_root/LICENSE" "$package_dir/usr/share/doc/firewall-web/LICENSE"
+install -m 644 "$repo_root/debian/copyright" "$package_dir/usr/share/doc/firewall-web/copyright"
 
 cat > "$package_dir/DEBIAN/control" <<EOF
 Package: firewall-web
@@ -42,12 +49,14 @@ Version: $version
 Section: net
 Priority: optional
 Architecture: $architecture
-Depends: python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0), iptables, nftables, systemd
+Depends: python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0), iptables, nftables
+Recommends: systemd
 Maintainer: Firewall Web contributors
 Homepage: https://github.com/arslandevpk/firewall-web
 Description: Local web console for the Linux firewall
  View and manage nftables and IPv4/IPv6 iptables rules, configure masquerading,
- save backups, and explicitly configure boot-time persistence.
+ save backups, and explicitly configure boot-time persistence. Install and run
+ as root; the service administers this host's live firewall.
 EOF
 
 cat > "$package_dir/DEBIAN/conffiles" <<'EOF'
@@ -57,7 +66,7 @@ EOF
 cat > "$package_dir/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
-if [ -d /run/systemd/system ]; then
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
 fi
 EOF
@@ -65,7 +74,7 @@ EOF
 cat > "$package_dir/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
-if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+if [ "$1" = remove ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet firewall-web.service || systemctl is-enabled --quiet firewall-web.service; then
         systemctl disable --now firewall-web.service
     fi
@@ -75,7 +84,7 @@ EOF
 cat > "$package_dir/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
-if [ -d /run/systemd/system ]; then
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
 fi
 EOF
@@ -83,5 +92,5 @@ EOF
 chmod 755 "$package_dir/DEBIAN/postinst" "$package_dir/DEBIAN/prerm" "$package_dir/DEBIAN/postrm"
 find "$package_dir" -type d -exec chmod 755 {} +
 mkdir -p "$output_dir"
-dpkg-deb --build --root-owner-group "$package_dir" \
+dpkg-deb --build --root-owner-group -Zxz "$package_dir" \
   "$output_dir/firewall-web_${version}_${architecture}.deb"
