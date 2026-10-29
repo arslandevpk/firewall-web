@@ -24,7 +24,7 @@ firewall-web.service service. No application firewall changes occur at startup.
 DEBIAN PACKAGE ARTIFACTS
 Run the "Build Debian packages" workflow from the GitHub Actions tab and enter
 a package version to build amd64 and arm64 .deb artifacts. The packages require
-system Python, Flask 3.1+, Waitress 3+, iptables, nftables, and systemd.
+system Python 3.10+, Flask 2.0+, Waitress 2.0+, iptables, nftables, and systemd.
 Install the matching artifact with:
   sudo apt install ./firewall-web_VERSION_ARCH.deb
 The package installs a disabled service and a root-only configuration file with

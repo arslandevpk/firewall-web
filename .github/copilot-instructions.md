@@ -13,7 +13,7 @@ The application lives in `firewall-web-standalone/`; run the commands below from
 
 ## Architecture
 
-- This is a deliberately single-file Flask application: `firewall_web.py` contains backend command handling, JSON API routes, and the complete HTML/CSS/JavaScript UI. `requirements.txt` lists Flask and Waitress; `install.sh` and `firewall-web.service` install and run it as a systemd service.
+- This is a deliberately single-file Flask application: `firewall_web.py` contains backend command handling, JSON API routes, and the complete HTML/CSS/JavaScript UI. `requirements.txt` lists Flask (2.0+) and Waitress (2.0+); `install.sh` and `firewall-web.service` install and run it as a systemd service.
 - The UI authenticates API requests with the `X-Secret` header and uses the API routes in `firewall_web.py` to view and modify live firewall state. Firewall operations support native nftables and multiple iptables backends; iptables-nft and native nftables can overlap, so the UI reports backend views rather than treating them as separate rule totals.
 - Live rule changes are separate from boot persistence. Backups are made before changes; iptables persistence uses netfilter-persistent, while native nft persistence saves only non-iptables-owned tables and installs a separate restore unit.
 - Runtime configuration is read from environment variables at process start. The Python process does not load `.env` files; the systemd unit loads `/etc/firewall-web/firewall-web.env`.
