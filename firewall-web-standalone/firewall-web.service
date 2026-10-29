@@ -1,0 +1,17 @@
+[Unit]
+Description=Firewall Web - local Linux firewall console
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/firewall-web
+EnvironmentFile=/etc/firewall-web/firewall-web.env
+ExecStart=/opt/firewall-web/venv/bin/python /opt/firewall-web/firewall_web.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
