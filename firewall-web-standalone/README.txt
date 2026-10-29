@@ -4,6 +4,8 @@ A small web console for the Linux firewall on the machine where it runs.
 View nftables and IPv4/IPv6 iptables rules, add/delete rules, create chains,
 set policies, allow service ports (including stateless mode), manage
 masquerading, export/back up rules, and explicitly save rules for reboot.
+See the repository's GLOSSARY.md for definitions of UI, firewall, permissions,
+networking, and packaging terms.
 Includes the responsive browser UI. No agent, hub, connected-server feature,
 Cloudflare account, external API, or Tailscale installation is required.
 The bundled Hack, JetBrains Mono, Fira Code, Source Code Pro, Cascadia Code,
