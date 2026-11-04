@@ -76,6 +76,9 @@ FONT_ASSETS = {
 }
 PATH = '/usr/sbin:/sbin:/usr/bin:/bin'
 LOCK = threading.RLock()
+DETECTION_LOCK = threading.Lock()
+SELECTED_BACKEND_AT_START = None
+SELECTION_REVIEW_REQUIRED = False
 TABLES = ('filter', 'nat', 'mangle', 'raw', 'security')
 BACKENDS = {
     'iptables': 'iptables-save', 'ip6tables': 'ip6tables-save',
@@ -83,6 +86,7 @@ BACKENDS = {
     'iptables-legacy': 'iptables-legacy-save',
     'ip6tables-legacy': 'ip6tables-legacy-save',
 }
+BACKEND_CHOICES = ('auto', 'ufw', 'firewalld', 'nftables', 'iptables', 'inspection')
 
 
 def has_net_admin():
@@ -114,6 +118,354 @@ def read_only_reason():
     return ('Kernel CAP_NET_ADMIN is unavailable. Firewall changes are disabled. '
             'Termux PRoot, unprivileged containers, and some userspace guests cannot '
             'manage the host firewall.')
+
+
+def _probe(name, args=()):
+    if not executable(name):
+        return {'installed': False, 'available': False}
+    try:
+        out, error, rc = run(name, args)
+    except Problem as exc:
+        return {'installed': True, 'available': False, 'error': exc.message}
+    result = {'installed': True, 'available': rc == 0, 'returncode': rc}
+    if rc == 0:
+        result['output'] = out.strip()
+    else:
+        message = (error or out).strip()
+        result['error'] = message or f'{name} exited with status {rc}'
+        if 'permission denied' in message.lower() or 'operation not permitted' in message.lower():
+            result['available'] = False
+            result['permission_denied'] = True
+    return result
+
+
+def _systemd_service(name):
+    if not executable('systemctl'):
+        return {'available': False}
+    active = _probe('systemctl', ['is-active', '--quiet', name])
+    enabled = _probe('systemctl', ['is-enabled', '--quiet', name])
+    unavailable = any(marker in (active.get('error', '') + enabled.get('error', '')).lower()
+                      for marker in ('not been booted with systemd', 'failed to connect to bus',
+                                     'system has not been booted'))
+    if unavailable:
+        return {'available': False, 'active': None, 'enabled': None}
+    return {
+        'available': True,
+        'active': active.get('returncode') == 0 if active.get('available') or active.get('returncode') is not None else None,
+        'enabled': enabled.get('returncode') == 0 if enabled.get('available') or enabled.get('returncode') is not None else None,
+    }
+
+
+def _save_rules(name):
+    probe = _probe(name, ['-c'])
+    if not probe.get('available'):
+        return probe
+    parsed = parse_save(probe['output'], name.removesuffix('-save'))
+    probe['rule_count'] = len(parsed['rules'])
+    probe['tables'] = parsed['tables']
+    probe['chains'] = parsed['chains']
+    probe['canonical'] = canonical_save(probe['output'])
+    probe['populated'] = bool(parsed['rules']) or any(
+        chain['policy'] not in ('ACCEPT', '-') for chain in parsed['chains'])
+    return probe
+
+
+def _ufw_ipv6_setting():
+    try:
+        for line in Path('/etc/default/ufw').read_text().splitlines():
+            if line.strip().startswith('IPV6='):
+                return line.split('=', 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def detect_firewall():
+    """Read-only inventory and conservative selection of the controlling manager."""
+    ufw = _probe('ufw', ['status', 'verbose'])
+    ufw_rules = _probe('ufw', ['status', 'numbered'])
+    ufw_text = ufw.get('output', '')
+    ufw_active = (re.search(r'(?im)^Status:\s*active\s*$', ufw_text) is not None
+                  if ufw.get('available') else None)
+    ufw_info = {
+        'installed': ufw.get('installed', False),
+        'status': 'not installed' if not ufw.get('installed') else
+                  'active' if ufw_active is True else 'inactive' if ufw_active is False else 'unknown',
+        'version': _probe('ufw', ['--version']).get('output'),
+        'default_policies': next((line.split(':', 1)[1].strip()
+                                  for line in ufw_text.splitlines()
+                                  if line.lower().startswith('default:')), None),
+        'ipv6': _ufw_ipv6_setting(),
+        'rule_count': sum(bool(re.match(r'^\s*\[\s*\d+\]', line))
+                          for line in ufw_rules.get('output', '').splitlines())
+                      if ufw_rules.get('available') else None,
+        'permission_denied': ufw.get('permission_denied', False),
+    }
+
+    firewalld = _probe('firewall-cmd', ['--state'])
+    firewalld_state = (firewalld.get('output') or firewalld.get('error', '')).strip()
+    firewalld_service = _systemd_service('firewalld.service')
+    if firewalld_state.lower() == 'not running':
+        firewalld_active = False
+    elif firewalld_state.lower() == 'running' and firewalld.get('available'):
+        firewalld_active = True
+    else:
+        firewalld_active = firewalld_service.get('active')
+    zones = _probe('firewall-cmd', ['--get-active-zones']) if firewalld_active else {'available': False}
+    zone_details = {}
+    if zones.get('available'):
+        current_zone = None
+        for line in zones['output'].splitlines():
+            if line and not line[:1].isspace():
+                current_zone = line.strip()
+                zone_details[current_zone] = {'interfaces': [], 'sources': []}
+            elif current_zone and line.strip():
+                kind, _, value = line.strip().partition(':')
+                if kind in ('interfaces', 'sources') and value.strip():
+                    zone_details[current_zone][kind] = value.split()
+    firewalld_info = {
+        'installed': firewalld.get('installed', False),
+        'status': 'not installed' if not firewalld.get('installed') else
+                  'active' if firewalld_active is True else 'inactive' if firewalld_active is False else 'unknown',
+        'version': _probe('firewall-cmd', ['--version']).get('output'),
+        'active_zones': zone_details if zones.get('available') else None,
+        'permission_denied': firewalld.get('permission_denied', False),
+    }
+
+    saves = {}
+    for name in ('iptables-save', 'ip6tables-save', 'iptables-nft-save', 'ip6tables-nft-save',
+                 'iptables-legacy-save', 'ip6tables-legacy-save'):
+        if executable(name):
+            saves[name] = _save_rules(name)
+    nft = _probe('nft', ['-j', '-a', '-n', 'list', 'ruleset'])
+    nft_tables = []
+    payload = {}
+    if nft.get('available'):
+        try:
+            payload = json.loads(nft['output'])
+            nft_tables = [entry['table'] for entry in payload.get('nftables', []) if 'table' in entry]
+        except (ValueError, TypeError, KeyError):
+            nft['available'] = False
+            nft['error'] = 'nft returned an invalid JSON ruleset'
+    compat = set()
+    for name in ('iptables-nft-save', 'ip6tables-nft-save'):
+        if saves.get(name, {}).get('available'):
+            family = 'ip6' if name.startswith('ip6') else 'ip'
+            compat.update((family, table) for table in saves[name].get('tables', []))
+    firewalld_tables = [table for table in nft_tables if table.get('name') == 'firewalld']
+    native_tables = [table for table in nft_tables
+                     if (table.get('family'), table.get('name')) not in compat
+                     and table.get('name') != 'firewalld']
+    native_keys = {(table.get('family'), table.get('name')) for table in native_tables}
+    native_rules = [entry['rule'] for entry in payload.get('nftables', [])
+                    if nft.get('available') and isinstance(entry, dict) and 'rule' in entry
+                    and (entry['rule'].get('family'), entry['rule'].get('table')) in native_keys]
+    native_chains = [entry['chain'] for entry in payload.get('nftables', [])
+                     if nft.get('available') and isinstance(entry, dict) and 'chain' in entry
+                     and (entry['chain'].get('family'), entry['chain'].get('table')) in native_keys]
+    native_enforcing_chains = [chain for chain in native_chains
+                               if chain.get('hook') and chain.get('policy') not in (None, 'accept')]
+    native_populated = bool(native_rules or native_enforcing_chains)
+
+    legacy_populated = any(saves.get(name, {}).get('populated', False) for name in
+                           ('iptables-legacy-save', 'ip6tables-legacy-save'))
+    default_populated = any(saves.get(name, {}).get('populated', False) for name in
+                            ('iptables-save', 'ip6tables-save'))
+    nft_compat_populated = any(saves.get(name, {}).get('populated', False) for name in
+                               ('iptables-nft-save', 'ip6tables-nft-save'))
+    default_versions, default_modes = {}, {}
+    alternative_conflict = False
+    write_backends = []
+    for family, command in (('ip', 'iptables'), ('ip6', 'ip6tables')):
+        version = _probe(command, ['--version']).get('output')
+        mode = ('nf_tables' if version and 'nf_tables' in version
+                else 'legacy' if version else 'unknown')
+        default_versions[family] = version
+        default_modes[family] = mode
+        default_name = command + '-save'
+        nft_name, legacy_name = command + '-nft-save', command + '-legacy-save'
+        default_rules = saves.get(default_name, {}).get('populated', False)
+        nft_rules = saves.get(nft_name, {}).get('populated', False)
+        legacy_rules = saves.get(legacy_name, {}).get('populated', False)
+        if nft_rules and legacy_rules:
+            alternative_conflict = True
+        if default_rules and ((mode == 'nf_tables' and legacy_rules)
+                              or (mode == 'legacy' and nft_rules)
+                              or (mode == 'unknown' and (nft_rules or legacy_rules))):
+            alternative_conflict = True
+        if (default_rules and mode == 'nf_tables' and nft_rules
+                and saves[default_name].get('canonical') != saves[nft_name].get('canonical')):
+            alternative_conflict = True
+        if (default_rules and mode == 'legacy' and legacy_rules
+                and saves[default_name].get('canonical') != saves[legacy_name].get('canonical')):
+            alternative_conflict = True
+        if default_rules:
+            write_backends.append(command)
+            alias = nft_name if mode == 'nf_tables' else legacy_name if mode == 'legacy' else None
+            if (alias and saves.get(alias, {}).get('available')
+                    and saves[default_name].get('canonical') == saves[alias].get('canonical')):
+                write_backends.append(command + ('-nft' if mode == 'nf_tables' else '-legacy'))
+        elif nft_rules and not legacy_rules:
+            write_backends.append(command + '-nft')
+        elif legacy_rules and not nft_rules:
+            write_backends.append(command + '-legacy')
+    modes = set(default_modes.values()) - {'unknown'}
+    default_implementation = (next(iter(modes)) if len(modes) == 1
+                              else 'mixed' if len(modes) > 1 else 'unknown')
+    default_iptables_version = default_versions['ip']
+    ufw_owned_chains = sorted({chain['name'] for save in saves.values()
+                               for chain in save.get('chains', [])
+                               if re.match(r'(?i)^ufw[-_]', chain['name'])})
+    possible_manager_ownership = bool(ufw_owned_chains and ufw_active is not True)
+    possible_manager_ownership = possible_manager_ownership or bool(
+        firewalld_tables and firewalld_active is not True)
+    netfilter_service = _systemd_service('netfilter-persistent.service')
+    netfilter_service['installed'] = bool(executable('netfilter-persistent')
+                                          or any(path.exists() for path in IPT_PLUGINS))
+    persistence = {
+        'netfilter_persistent': netfilter_service,
+        'iptables_persistent': {
+            'installed': any(Path(path).exists() for path in ('/etc/iptables/rules.v4', '/etc/iptables/rules.v6'))
+                          or any(path.exists() for path in IPT_PLUGINS),
+            'files': [path for path in ('/etc/iptables/rules.v4', '/etc/iptables/rules.v6') if Path(path).exists()],
+        },
+        'nftables': _systemd_service('nftables.service'),
+        'native_restore': _systemd_service('nft-web-restore.service'),
+    }
+    listeners = _probe('ss', ['-lnt'])
+    forwarded = {}
+    for family, path in (('ipv4', '/proc/sys/net/ipv4/ip_forward'),
+                         ('ipv6', '/proc/sys/net/ipv6/conf/all/forwarding')):
+        try:
+            forwarded[family] = Path(path).read_text().strip() == '1'
+        except OSError:
+            forwarded[family] = None
+
+    active_managers = [name for name, active in (('ufw', ufw_active), ('firewalld', firewalld_active)) if active]
+    uncertain = ufw_active is None and ufw_info['installed']
+    uncertain = uncertain or (firewalld_active is None and firewalld_info['installed'])
+    uncertain = uncertain or (bool(executable('nft')) and not nft.get('available'))
+    uncertain = uncertain or any(info.get('installed') and not info.get('available')
+                                 for info in saves.values())
+    uncertain = uncertain or possible_manager_ownership
+    direct = []
+    if native_populated:
+        direct.append('nftables')
+    if default_populated or legacy_populated or nft_compat_populated:
+        direct.append('iptables')
+    if len(active_managers) > 1:
+        reason = 'Multiple firewall managers report active; writes are disabled until an administrator resolves ownership.'
+        selected = 'inspection'
+    elif uncertain:
+        reason = ('Manager-owned rules were found but the owning manager is inactive or unknown; writes are disabled.'
+                  if possible_manager_ownership else
+                  'Firewall state is unknown because a required inspection command failed or permission was denied; writes are disabled.')
+        selected = 'inspection'
+    elif active_managers:
+        selected = active_managers[0]
+        reason = f'{selected} is active; direct ruleset editors must not bypass it.'
+    elif alternative_conflict:
+        reason = 'Both iptables-nft and iptables-legacy contain rules; their ownership is ambiguous.'
+        selected = 'inspection'
+    elif len(direct) > 1:
+        reason = 'Independently populated direct firewall backends were detected; ownership is ambiguous.'
+        selected = 'inspection'
+    elif direct:
+        selected = direct[0]
+        reason = f'Direct {selected} rules were detected; only this selected backend is eligible for writes.'
+    else:
+        selected = 'inspection'
+        reason = 'No active firewall manager or populated direct ruleset was detected; no firewall will be enabled automatically.'
+
+    requested = os.environ.get('NFT_BACKEND', 'auto').strip().lower()
+    if requested not in BACKEND_CHOICES:
+        reason = f'Invalid NFT_BACKEND={requested!r}; inspection-only mode is active.'
+        selected = 'inspection'
+    elif requested != 'auto':
+        if requested == selected:
+            pass
+        elif requested == 'inspection':
+            selected = 'inspection'
+            reason = 'Inspection-only mode was explicitly selected.'
+        elif (requested in ('nftables', 'iptables') and requested in direct
+              and not active_managers and not uncertain and not alternative_conflict):
+            selected = requested
+            reason = f'{requested} was explicitly selected; other populated backends remain separately scoped and are not changed by this selection.'
+        else:
+            reason = f'NFT_BACKEND={requested} conflicts with detected ownership ({selected}); inspection-only mode is active.'
+            selected = 'inspection'
+    return {
+        'managers': {'ufw': ufw_info, 'firewalld': firewalld_info},
+        'direct': {
+            'nftables': {'installed': bool(executable('nft')), 'tables': native_tables,
+                         'underlying_packet_filter': 'nf_tables' if nft_tables else 'unknown',
+                         'version': _probe('nft', ['--version']).get('output'),
+                         'status': 'populated' if native_populated else 'empty' if nft.get('available') else 'unknown'},
+            'iptables': {'installed': bool(saves), 'alternatives': {
+                             name: {key: value for key, value in info.items()
+                                    if key not in ('output', 'canonical')}
+                             for name, info in saves.items()},
+                         'default_implementation': default_implementation,
+                         'default_version': default_iptables_version,
+                         'default_versions': default_versions,
+                         'status': 'populated' if default_populated or legacy_populated or nft_compat_populated else 'empty' if saves else 'unknown'},
+        },
+        'persistence': persistence,
+        'interfaces': [name for _, name in socket.if_nameindex()],
+        'listeners': listeners.get('output') if listeners.get('available') else listeners.get('error'),
+        'forwarding': forwarded,
+        'service_owners': [
+            {'service': label, 'chains': sorted({chain['name'] for save in saves.values()
+                                                 for chain in save.get('chains', [])
+                                                 if re.search(pattern, chain['name'])} |
+                                                {chain['name'] for chain in native_chains
+                                                 if re.search(pattern, chain.get('name', ''))})}
+            for label, pattern in (('UFW', r'(?i)^ufw[-_]'), ('Docker', r'(?i)DOCKER'), ('Podman', r'(?i)CNI|NETAVARK'),
+                                   ('libvirt', r'(?i)LIBVIRT'), ('Tailscale', r'(?i)TS-'))
+            if any(re.search(pattern, chain['name'])
+                   for save in saves.values() for chain in save.get('chains', []))
+            or any(re.search(pattern, chain.get('name', '')) for chain in native_chains)
+        ] + ([{'service': 'firewalld', 'chains': []}] if firewalld_tables else []),
+        'ownership_concerns': {'ufw_chains': ufw_owned_chains,
+                               'firewalld_tables': firewalld_tables if firewalld_active is not True else []},
+        'active_managers': active_managers,
+        'selected_backend': selected,
+        'write_backends': write_backends if selected == 'iptables' else [],
+        'reason': reason,
+        'can_write': can_manage_firewall() and selected in ('nftables', 'iptables'),
+        'manager_can_write': can_manage_firewall() and selected in ('ufw', 'firewalld'),
+    }
+
+
+def current_detection():
+    global SELECTED_BACKEND_AT_START, SELECTION_REVIEW_REQUIRED
+    report = detect_firewall()
+    with DETECTION_LOCK:
+        selected = report['selected_backend']
+        if SELECTED_BACKEND_AT_START is None:
+            SELECTED_BACKEND_AT_START = selected
+        elif selected != SELECTED_BACKEND_AT_START:
+            SELECTION_REVIEW_REQUIRED = True
+        report['previous_backend'] = SELECTED_BACKEND_AT_START if SELECTION_REVIEW_REQUIRED else None
+        report['selection_review_required'] = SELECTION_REVIEW_REQUIRED
+    return report
+
+
+def accept_current_detection():
+    global SELECTED_BACKEND_AT_START, SELECTION_REVIEW_REQUIRED
+    report = detect_firewall()
+    if report['selected_backend'] == 'inspection':
+        raise Problem(report['reason'], 409)
+    with DETECTION_LOCK:
+        SELECTED_BACKEND_AT_START = report['selected_backend']
+        SELECTION_REVIEW_REQUIRED = False
+    if report['selected_backend'] == 'ufw':
+        _, _, report['manager_state_token'] = _ufw_state()
+    elif report['selected_backend'] == 'firewalld':
+        report['manager_state_token'] = signature(_firewalld_state())
+    report['previous_backend'] = None
+    report['selection_review_required'] = False
+    return report
 
 
 class Problem(Exception):
@@ -191,6 +543,10 @@ def backend(d):
         raise Problem('Invalid iptables backend.')
     if not executable(b):
         raise Problem(f'{b} is not installed.', 503)
+    detection = current_detection()
+    if (detection['selection_review_required'] or detection['selected_backend'] != 'iptables'
+            or b not in detection['write_backends']):
+        raise Problem(f'{b} is not part of the selected writable iptables backend. Refresh detection.', 409)
     return b
 
 
@@ -517,6 +873,37 @@ def authenticate():
         raise Problem('Cross-origin requests are not allowed.', 403)
     if request.method not in ('GET', 'HEAD', 'OPTIONS') and not can_manage_firewall():
         raise Problem(read_only_reason(), 403)
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        if request.path == '/api/backup':
+            return None
+        detection = current_detection()
+        if detection['selection_review_required'] and request.path != '/api/detection/review':
+            raise Problem('The selected firewall backend changed while the application was running. Refresh and explicitly review the new selection before writing.', 409)
+        if request.path == '/api/detection/review':
+            return None
+        manager = ('ufw' if request.path.startswith('/api/ufw/')
+                   else 'firewalld' if request.path.startswith('/api/firewalld/') else None)
+        if manager:
+            if detection['selected_backend'] != manager or not detection['manager_can_write']:
+                raise Problem(detection['reason'], 409 if detection['selected_backend'] != manager else 403)
+        elif detection['selected_backend'] not in ('nftables', 'iptables'):
+            raise Problem(detection['reason'], 409)
+        path_backend = None
+        if request.path.startswith('/api/nft/') or request.path == '/api/persist/nft':
+            path_backend = 'nftables'
+        elif request.path.startswith('/api/iptables/') or request.path == '/api/persist/iptables':
+            path_backend = 'iptables'
+        elif request.path == '/api/masquerade':
+            engine = (request.get_json(silent=True) or {}).get('engine', 'nft')
+            path_backend = 'nftables' if engine == 'nft' else 'iptables'
+        elif request.path == '/api/exec':
+            engine = (request.get_json(silent=True) or {}).get('engine', 'nft')
+            path_backend = 'nftables' if engine == 'nft' else 'iptables'
+        if path_backend and detection['selected_backend'] != path_backend:
+            raise Problem(f'{detection["selected_backend"]} is selected; this operation targets {path_backend}.', 409)
+        if (request.path == '/api/persist/iptables'
+                and not {'iptables', 'ip6tables'}.issubset(detection['write_backends'])):
+            raise Problem('The system-default iptables backends are not the selected writable alternatives.', 409)
 
 
 @app.after_request
@@ -567,11 +954,268 @@ def status():
             return Path(path).read_text().strip() == '1'
         except OSError:
             return None
-    return jsonify(nft=bool(executable('nft')), backends=installed,
+    detection = current_detection()
+    detection['report_version'] = 1
+    return jsonify(nft=bool(executable('nft')), backends=installed, detection=detection,
                    root=os.geteuid() == 0, interfaces=[n for _, n in socket.if_nameindex()],
-                   can_manage_firewall=can_manage_firewall(), read_only_reason=read_only_reason(),
+                   can_manage_firewall=can_manage_firewall(),
+                   read_only_reason=read_only_reason() or ('' if detection['can_write'] or detection['manager_can_write'] else detection['reason']),
                    forwarding={'ip': flag('/proc/sys/net/ipv4/ip_forward'),
                                'ip6': flag('/proc/sys/net/ipv6/conf/all/forwarding')})
+
+
+@app.get('/api/detection')
+def detection_report():
+    report = current_detection()
+    report['report_version'] = 1
+    return jsonify(report)
+
+
+@app.post('/api/detection/review')
+def review_detection():
+    if text(data(), 'confirm') != 'REVIEW':
+        raise Problem('Type REVIEW to acknowledge the detected backend and manager state.')
+    report = accept_current_detection()
+    return jsonify(ok=True, detection=report,
+                   message='Current firewall backend selection reviewed. No firewall rules were changed.')
+
+
+def _ufw_rules():
+    raw = checked('ufw', ['status', 'numbered'])
+    rules = []
+    for line in raw.splitlines():
+        match = re.match(r'^\s*\[\s*(\d+)\]\s+(.+?)\s*$', line)
+        if match:
+            text_value = match[2]
+            rules.append({'number': int(match[1]), 'text': text_value,
+                          'token': signature([int(match[1]), text_value])})
+    return raw, rules
+
+
+def _ufw_state():
+    verbose = checked('ufw', ['status', 'verbose'])
+    numbered, rules = _ufw_rules()
+    payload = {'verbose': verbose, 'numbered': numbered, 'ipv6': _ufw_ipv6_setting()}
+    return payload, rules, signature(payload)
+
+
+def _firewalld_state():
+    zones = _firewalld_zones()
+    state = {zone: {'runtime': _firewalld_zone(zone),
+                    'permanent': _firewalld_zone(zone, True)}
+             for zone in zones}
+    active = _probe('firewall-cmd', ['--get-active-zones'])
+    payload = {'zones': state, 'active_zones': active.get('output'),
+               'default_zone': _probe('firewall-cmd', ['--get-default-zone']).get('output')}
+    return payload
+
+
+def _require_state_token(d, current):
+    supplied = text(d, 'state_token')
+    if not hmac.compare_digest(supplied, current):
+        raise Problem('Firewall manager configuration changed. Refresh detection and review the current rules before retrying.', 409)
+
+
+@app.get('/api/ufw')
+def ufw_status():
+    detection = current_detection()
+    if detection['selected_backend'] != 'ufw':
+        raise Problem('UFW is not the selected active manager.', 409)
+    payload, rules, token = _ufw_state()
+    return jsonify(status=payload['verbose'], rules=rules, state_token=token,
+                   defaults=next((line.split(':', 1)[1].strip()
+                                  for line in payload['verbose'].splitlines()
+                                  if line.lower().startswith('default:')), None),
+                   ipv6=payload['ipv6'], numbered=payload['numbered'])
+
+
+@app.post('/api/ufw/rule')
+def ufw_add_rule():
+    d = data()
+    action = text(d, 'action')
+    if action not in ('allow', 'deny', 'reject', 'limit'):
+        raise Problem('UFW action must be allow, deny, reject, or limit.')
+    port, protocol = service_port(text(d, 'port')), text(d, 'protocol', 'tcp')
+    if protocol not in ('tcp', 'udp'):
+        raise Problem('Protocol must be tcp or udp.')
+    source = text(d, 'source', 'any', 128)
+    if source != 'any':
+        try:
+            source = str(ipaddress.ip_network(source, strict=False))
+        except ValueError:
+            raise Problem('Source must be a valid IPv4 or IPv6 address or network.')
+    comment = text(d, 'comment', '', 120)
+    if comment and not re.fullmatch(r'[A-Za-z0-9 .:_-]+', comment):
+        raise Problem('Comment may contain letters, numbers, spaces, and . : _ - only.')
+    with LOCK:
+        _, _, token = _ufw_state()
+        _require_state_token(d, token)
+        saved = backup()
+        _, _, token = _ufw_state()
+        _require_state_token(d, token)
+        args = [action]
+        if source == 'any':
+            args.append(f'{port}/{protocol}')
+        else:
+            args += ['from', source, 'to', 'any', 'port', port, 'proto', protocol]
+        if comment:
+            args += ['comment', comment]
+        checked('ufw', args)
+        state_token = _ufw_state()[2]
+    return jsonify(ok=True, backup=saved, state_token=state_token,
+                   message='Rule added through UFW; IPv4/IPv6 handling and persistence remain managed by UFW.')
+
+
+@app.delete('/api/ufw/rule')
+def ufw_delete_rule():
+    d = data()
+    number, token = integer(d.get('number'), maximum=1000000), text(d, 'token')
+    with LOCK:
+        _, rules, state_token = _ufw_state()
+        _require_state_token(d, state_token)
+        found = [rule for rule in rules if rule['number'] == number]
+        if len(found) != 1 or not hmac.compare_digest(found[0]['token'], token):
+            raise Problem('UFW rule changed or was renumbered. Refresh and select it again.', 409)
+        saved = backup()
+        _, rules, state_token = _ufw_state()
+        _require_state_token(d, state_token)
+        found = [rule for rule in rules if rule['number'] == number]
+        if len(found) != 1 or not hmac.compare_digest(found[0]['token'], token):
+            raise Problem('UFW rule changed or was renumbered during deletion. Refresh and select it again.', 409)
+        checked('ufw', ['--force', 'delete', str(number)])
+        state_token = _ufw_state()[2]
+    return jsonify(ok=True, backup=saved, state_token=state_token,
+                   message='Selected numbered UFW rule deleted after revalidation.')
+
+
+@app.post('/api/ufw/default')
+def ufw_default():
+    d = data()
+    direction, policy = text(d, 'direction'), text(d, 'policy')
+    if direction not in ('incoming', 'outgoing', 'routed') or policy not in ('allow', 'deny', 'reject'):
+        raise Problem('Choose incoming, outgoing, or routed and allow, deny, or reject.')
+    if text(d, 'confirm') != 'APPLY':
+        raise Problem('Default policy changes require typing APPLY.')
+    with LOCK:
+        _, _, token = _ufw_state()
+        _require_state_token(d, token)
+        saved = backup()
+        _, _, token = _ufw_state()
+        _require_state_token(d, token)
+        checked('ufw', ['default', policy, direction])
+        state_token = _ufw_state()[2]
+    return jsonify(ok=True, backup=saved, state_token=state_token,
+                   message=f'UFW default {direction} policy set to {policy}.')
+
+
+@app.post('/api/ufw/action')
+def ufw_action():
+    d = data()
+    action = text(d, 'action')
+    confirmations = {'enable': 'ENABLE', 'disable': 'DISABLE', 'reload': 'RELOAD'}
+    if action not in confirmations or text(d, 'confirm') != confirmations[action]:
+        raise Problem('Enable, disable, and reload require the corresponding explicit confirmation.')
+    with LOCK:
+        _, _, token = _ufw_state()
+        _require_state_token(d, token)
+        saved = backup()
+        _, _, token = _ufw_state()
+        _require_state_token(d, token)
+        args = ['--force', action] if action in ('enable', 'disable') else [action]
+        checked('ufw', args)
+        state_token = _ufw_state()[2]
+    return jsonify(ok=True, backup=saved, state_token=state_token,
+                   message=f'UFW {action} completed through the UFW command interface.')
+
+
+def _firewalld_zones():
+    return checked('firewall-cmd', ['--get-zones']).split()
+
+
+def _firewalld_zone(zone, permanent=False):
+    args = ['--zone', zone, '--list-all']
+    if permanent:
+        args.insert(0, '--permanent')
+    output = checked('firewall-cmd', args)
+    values = {}
+    for line in output.splitlines():
+        key, separator, value = line.strip().partition(':')
+        if separator:
+            values[key] = value.strip().split()
+    return values
+
+
+@app.get('/api/firewalld')
+def firewalld_status():
+    detection = current_detection()
+    if detection['selected_backend'] != 'firewalld':
+        raise Problem('firewalld is not the selected active manager.', 409)
+    state = _firewalld_state()
+    state['state_token'] = signature(state)
+    return jsonify(version=_probe('firewall-cmd', ['--version']).get('output'),
+                   active_zones=detection['managers']['firewalld']['active_zones'],
+                   default_zone=state['default_zone'], zones=state['zones'],
+                   state_token=state['state_token'])
+
+
+@app.post('/api/firewalld/rule')
+def firewalld_rule():
+    d = data()
+    zone, action = text(d, 'zone'), text(d, 'action')
+    rule_type, value = text(d, 'type'), text(d, 'value')
+    state = text(d, 'state')
+    if action not in ('add', 'remove') or state not in ('runtime', 'permanent'):
+        raise Problem('Choose add/remove and runtime/permanent.')
+    state_token = signature(_firewalld_state())
+    _require_state_token(d, state_token)
+    if zone not in _firewalld_zones():
+        raise Problem('Select an installed firewalld zone.')
+    if rule_type == 'port':
+        port = service_port(value).replace(':', '-')
+        protocol = text(d, 'protocol', 'tcp')
+        if protocol not in ('tcp', 'udp'):
+            raise Problem('Protocol must be tcp or udp.')
+        value = f'{port}/{protocol}'
+        option = 'port'
+    elif rule_type == 'service':
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', value):
+            raise Problem('Invalid firewalld service name.')
+        if value not in checked('firewall-cmd', ['--get-services']).split():
+            raise Problem('Service is not available in firewalld.')
+        option = 'service'
+    else:
+        raise Problem('Only firewalld service and port rules are supported by this control.')
+    command = ['--zone', zone, f'--{action}-{option}={value}']
+    if state == 'permanent':
+        command.insert(0, '--permanent')
+    with LOCK:
+        current = _firewalld_state()
+        _require_state_token(d, signature(current))
+        if zone not in current['zones']:
+            raise Problem('Selected zone is no longer available.', 409)
+        saved = backup()
+        _require_state_token(d, signature(_firewalld_state()))
+        checked('firewall-cmd', command)
+        state_token = signature(_firewalld_state())
+    return jsonify(ok=True, backup=saved,
+                   state_token=state_token,
+                   message=f'{rule_type.title()} {value} {action}ed in {zone} {state} configuration. Runtime and permanent state were not conflated.')
+
+
+@app.post('/api/firewalld/reload')
+def firewalld_reload():
+    d = data()
+    if text(d, 'confirm') != 'RELOAD':
+        raise Problem('Reloading firewalld requires typing RELOAD.')
+    with LOCK:
+        current = _firewalld_state()
+        _require_state_token(d, signature(current))
+        saved = backup()
+        _require_state_token(d, signature(_firewalld_state()))
+        checked('firewall-cmd', ['--reload'])
+        state_token = signature(_firewalld_state())
+    return jsonify(ok=True, backup=saved, state_token=state_token,
+                   message='firewalld reloaded its permanent configuration.')
 
 
 @app.get('/api/rules')
@@ -1001,10 +1645,18 @@ body,button,input,select,textarea{font-family:var(--ui-font-family,ui-monospace,
 <div id="workspace" class="workspace">
 <header class="page-heading"><button id="menu-toggle" class="menu-toggle" aria-controls="sidebar" aria-expanded="false" aria-label="Open sections">Sections</button><div><h2 id="page-title">All Rules</h2><p id="page-description" class="muted">A complete view of the firewall backends installed on this machine.</p></div></header>
 <div class="row between toolbar"><div id="badges"></div><div class="row toolbar-actions"><button id="refresh" class="primary">Refresh</button><label>Auto-refresh<select id="auto"><option value="0">Off</option><option value="15">15 seconds</option><option value="30">30 seconds</option></select></label><button id="logout">Lock</button></div></div><p id="access-warning" class="muted notice warning hidden" role="status"></p>
+<section class="card" aria-labelledby="detection-heading"><div class="row between"><div><h2 id="detection-heading">Firewall manager detection</h2><p id="detection-summary" class="muted" role="status" aria-live="polite">Detection has not run yet.</p></div><div class="row"><button id="refresh-detection" type="button">Refresh detection</button><button id="review-detection" type="button" class="hidden">Review detected changes</button></div></div><pre id="detection-details"></pre>
+<div id="ufw-controls" class="hidden"><h3>UFW-managed rules</h3><p class="muted">Changes use UFW and are persisted by UFW. IPv4/IPv6 behavior follows UFW configuration.</p>
+<form id="ufw-add" class="manager-write-form"><div class="row"><label>Action<select name="action"><option>allow</option><option>deny</option><option>reject</option><option>limit</option></select></label><label>Port or range<input name="port" placeholder="22 or 8000:8010" required></label><label>Protocol<select name="protocol"><option>tcp</option><option>udp</option></select></label><label>Source network<input name="source" value="any" placeholder="any or 192.0.2.0/24"></label><label>Comment<input name="comment" maxlength="120"></label><button class="good">Add UFW rule</button></div></form>
+<p class="muted notice warning">Changing incoming/routed defaults or enabling UFW can disconnect SSH or the web UI. Review current rules and keep console access; this UI does not install an automatic rollback.</p><form id="ufw-default" class="manager-write-form"><div class="row"><label>Direction<select name="direction"><option>incoming</option><option>outgoing</option><option>routed</option></select></label><label>Policy<select name="policy"><option>allow</option><option>deny</option><option>reject</option></select></label><label>Type APPLY to confirm<input name="confirm" required></label><button class="danger">Set default policy</button></div></form>
+<div class="row"><button id="ufw-enable" type="button">Enable UFW</button><button id="ufw-disable" type="button" class="danger">Disable UFW</button><button id="ufw-reload" type="button">Reload UFW</button></div><pre id="ufw-status"></pre><div id="ufw-rules"></div></div>
+<div id="firewalld-controls" class="hidden"><h3>firewalld-managed rules</h3><p class="muted">Select a zone explicitly. Runtime changes do not become permanent; permanent changes require an explicit reload before taking effect.</p>
+<form id="firewalld-add" class="manager-write-form"><div class="row"><label>Zone<select id="firewalld-zone" name="zone" required></select></label><label>Rule type<select name="type"><option value="port">Port</option><option value="service">Service</option></select></label><label>Service name or port<input name="value" placeholder="ssh or 8443" required></label><label>Protocol<select name="protocol"><option>tcp</option><option>udp</option></select></label><label>Configuration<select name="state"><option value="runtime">Runtime</option><option value="permanent">Permanent</option></select></label><label>Action<select name="action"><option value="add">Add</option><option value="remove">Remove</option></select></label><button class="good">Apply firewalld change</button></div></form>
+<div class="row"><button id="firewalld-reload" type="button" class="danger">Reload from permanent configuration</button></div><pre id="firewalld-status"></pre></div></section>
 <section id="overview" class="panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0"><div class="card"><h2>All installed firewall views</h2><p class="muted">Full listings include all tables. iptables-nft overlaps with nftables; default and explicit backend commands may show the same rules. These are views, not independent rule totals.</p><div id="all-views"></div></div></section>
 <section id="nft" class="panel hidden" role="tabpanel" aria-labelledby="tab-nft" tabindex="0">
 <div class="card"><h2>nftables rules</h2><div class="row"><label class="wide">Search<input id="n-search" placeholder="Family, table, chain, expression or comment"></label><label>Filter<select id="n-filter"><option value="all">All rules</option><option value="masq">Masquerade only</option></select></label></div><div id="n-rules"></div><details><summary>Complete native ruleset | handles included</summary><pre id="n-raw"></pre></details></div>
-<form class="card firewall-write-form" id="n-add"><h2>Add nftables rule</h2><div class="row"><label>Family<select name="family"><option>inet</option><option>ip</option><option>ip6</option><option>bridge</option><option>arp</option><option>netdev</option></select></label><label>Table<input name="table" value="filter" required></label><label>Chain<input name="chain" value="input" required></label><label>Position<select name="operation"><option value="add">Append</option><option value="insert">Insert first</option></select></label></div><label>Rule expression<textarea name="rule" placeholder="ct state established,related counter accept" required></textarea></label><p class="muted">Use existing tables/chains, or create one below. Names are case-sensitive.</p><button class="good">Add rule</button></form>
+<form class="card firewall-write-form nft-write-form" id="n-add"><h2>Add nftables rule</h2><div class="row"><label>Family<select name="family"><option>inet</option><option>ip</option><option>ip6</option><option>bridge</option><option>arp</option><option>netdev</option></select></label><label>Table<input name="table" value="filter" required></label><label>Chain<input name="chain" value="input" required></label><label>Position<select name="operation"><option value="add">Append</option><option value="insert">Insert first</option></select></label></div><label>Rule expression<textarea name="rule" placeholder="ct state established,related counter accept" required></textarea></label><p class="muted">Use existing tables/chains, or create one below. Names are case-sensitive.</p><button class="good">Add rule</button></form>
 <form class="card firewall-write-form" id="n-chain"><h2>Create nftables table / chain</h2><div class="row"><label>Family<select name="family"><option>inet</option><option>ip</option><option>ip6</option></select></label><label>Table<input name="table" value="mini_firewall" required></label><label>Chain<input name="chain" value="input" required></label><label>Hook<select name="hook"><option value="">Regular chain (no hook)</option><option>input</option><option>output</option><option>forward</option><option>prerouting</option><option>postrouting</option></select></label><label>Type<select name="type"><option>filter</option><option>nat</option><option>route</option></select></label><label>Priority<input name="priority" type="number" value="0" class="small"></label><label>Policy<select name="policy"><option>accept</option><option>drop</option></select></label><button class="good">Create</button></div></form>
 </section>
 <section id="ipt" class="panel hidden" role="tabpanel" aria-labelledby="tab-ipt" tabindex="0">
@@ -1059,14 +1711,18 @@ function notice(message,error=false){const t=$('toast');t.textContent=message;t.
 async function api(path,method='GET',body=null){const r=await fetch(path,{method,headers:{'Content-Type':'application/json','X-Secret':key},body:body===null?null:JSON.stringify(body),cache:'no-store'});let d;try{d=await r.json()}catch{throw Error('Server returned an invalid response ('+r.status+').')}if(!r.ok||d.error)throw Error(d.error||'HTTP '+r.status);return d}
 function values(form){return Object.fromEntries(new FormData(form).entries())}
 function options(node,items){const old=node.value;node.replaceChildren();for(const [value,label] of items){const o=el('option',label);o.value=value;node.append(o)}if(items.some(x=>x[0]===old))node.value=old}
-function setFirewallWritable(allowed,reason=''){firewallWritable=allowed;for(const form of document.querySelectorAll('.firewall-write-form'))for(const control of form.elements)control.disabled=!allowed;for(const id of ['persist-ipt','persist-nft','backup'])$(id).disabled=!allowed;$('access-warning').textContent=reason;$('access-warning').classList.toggle('hidden',allowed)}
-async function change(path,method,body){if(!firewallWritable){notice(status.read_only_reason||'Firewall changes are disabled without CAP_NET_ADMIN.',true);return}if(busy)return;busy=true;$('app').setAttribute('aria-busy','true');try{const r=await api(path,method,body);notice((r.message||'Change applied.')+(r.backup?' Backup: '+r.backup:''));await refresh(true);return r}catch(e){notice(e.message,true)}finally{busy=false;$('app').setAttribute('aria-busy','false')}}
+function setFirewallWritable(allowed,reason=''){const selected=status.detection?.selected_backend,review=status.detection?.selection_review_required||status.managerDrift;firewallWritable=allowed&&!review;const manager=firewallWritable&&['ufw','firewalld'].includes(selected);for(const form of document.querySelectorAll('.firewall-write-form')){let enabled=firewallWritable&&['nftables','iptables'].includes(selected);if(form.id.startsWith('n-'))enabled=firewallWritable&&selected==='nftables';if(form.id.startsWith('i-'))enabled=firewallWritable&&selected==='iptables'&&status.detection.write_backends.length>0;for(const control of form.elements)control.disabled=!enabled}for(const form of document.querySelectorAll('.manager-write-form'))for(const control of form.elements)control.disabled=!manager;for(const id of ['persist-ipt','persist-nft'])$(id).disabled=!(firewallWritable&&(id==='persist-ipt'?selected==='iptables'&&status.detection.write_backends.includes('iptables')&&status.detection.write_backends.includes('ip6tables'):selected==='nftables'));for(const id of ['ufw-enable','ufw-disable','ufw-reload','firewalld-reload'])if($(id))$(id).disabled=!manager;$('backup').disabled=!allowed;$('review-detection').disabled=!allowed;$('review-detection').classList.toggle('hidden',!review);if(status.detection)$('detection-details').textContent=$('detection-details').textContent.split('\nManagement listeners:')[0]+'\nManagement listeners: '+(status.detection.listeners||'unknown');$('access-warning').textContent=reason;$('access-warning').classList.toggle('hidden',!reason)}
+async function change(path,method,body){if(!firewallWritable){notice(status.read_only_reason||'Firewall changes are disabled until the detected manager state is reviewed.',true);return}if(busy)return;busy=true;$('app').setAttribute('aria-busy','true');try{const r=await api(path,method,body);if(r.state_token){status.managerStateToken=r.state_token;status.managerDrift=false}notice((r.message||'Change applied.')+(r.backup?' Backup: '+r.backup:''));await refresh(true);return r}catch(e){notice(e.message,true)}finally{busy=false;$('app').setAttribute('aria-busy','false')}}
 function display(expr){if(expr===null)return '';if(typeof expr!=='object')return String(expr);if(Array.isArray(expr))return expr.map(display).join(', ');if(expr.payload)return expr.payload.protocol+' '+expr.payload.field;if(expr.meta)return 'meta '+expr.meta.key;if(expr.ct)return 'ct '+expr.ct.key;if(expr.prefix)return expr.prefix.addr+'/'+expr.prefix.len;if(expr.set)return '{ '+display(expr.set)+' }';if(expr.range)return expr.range.map(display).join('-');if(expr.match){const m=expr.match;return display(m.left)+' '+(m.op==='=='?'':m.op+' ')+display(m.right)}if(expr.counter)return 'counter packets '+(expr.counter.packets||0)+' bytes '+(expr.counter.bytes||0);for(const k of ['accept','drop','return','continue','masquerade'])if(k in expr)return k+(expr[k]?' '+JSON.stringify(expr[k]):'');for(const k of ['jump','goto'])if(expr[k])return k+' '+expr[k].target;return JSON.stringify(expr)}
 function ruleTable(rules,isNft){const table=el('table',undefined,'rules');const head=el('tr');for(const h of isNft?['Handle','Expression / comment','Action']:['#','Packets / bytes','Rule options','Action'])head.append(el('th',h));table.append(head);for(const r of rules){const row=el('tr');row.append(el('td',String(isNft?r.handle:r.number)));if(!isNft)row.append(el('td',r.packets+' / '+r.bytes));row.append(el('td',isNft?r.expr.map(display).join(' ')+(r.comment?' | comment '+r.comment:''):r.expression,'expr'));const cell=el('td'),button=el('button','Delete','danger');button.disabled=!firewallWritable;button.onclick=()=>{if(!firewallWritable)return;if(!confirm('Delete this exact rule?\n'+(isNft?r.expr.map(display).join(' '):r.expression)))return;change(isNft?'/api/nft/rule':'/api/iptables/rule','DELETE',isNft?{family:r.family,table:r.table,chain:r.chain,handle:r.handle,token:r.token}:{backend:ipt.backend,table:r.table,chain:r.chain,token:r.token})};cell.append(button);row.append(cell)}return table}
 function renderRules(state,isNft){const prefix=isNft?'n':'i',holder=$(prefix+'-rules');holder.replaceChildren();if(!state||state.error){holder.append(el('p',state?.error||'Backend unavailable.','muted'));$(prefix+'-raw').textContent=state?.error||'';return}const query=$(prefix+'-search').value.toLowerCase(),onlyMasq=$(prefix+'-filter').value==='masq';$(prefix+'-raw').textContent=state.raw||'(empty ruleset)';if(!isNft)$('i-version').textContent=state.version+' | IPv'+(state.backend.startsWith('ip6')?'6':'4');for(const c of state.chains){const f=isNft?c.family+' ':'';let rows=state.rules.filter(r=>r.table===c.table&&r.chain===c.name&&(!isNft||r.family===c.family));rows=rows.filter(r=>(!onlyMasq||r.masquerade)&&JSON.stringify(r).toLowerCase().includes(query));if((query||onlyMasq)&&!rows.length)continue;const details=el('details');details.open=true;const info=f+c.table+' / '+c.name+' | '+rows.length+' rules'+(c.policy?' | policy '+c.policy:'')+(c.hook?' | '+c.type+' / '+c.hook+' / priority '+c.prio:'');details.append(el('summary',info));const scroll=el('div',undefined,'scroll');scroll.append(rows.length?ruleTable(rows,isNft):el('p','No rules in this chain.','muted'));details.append(scroll);holder.append(details)}if(!state.chains.length)holder.append(el('p','No tables/chains in this view.','muted'))}
 function overviewView(){const host=$('all-views');host.replaceChildren();for(const [name,state]of Object.entries(snapshot.states)){const d=el('details');d.append(el('summary',name+' | '+(state.error?'unavailable':state.rules.length+' rules / '+state.chains.length+' chains')+(state.version?' | '+state.version:'')));d.append(el('pre',state.error||state.raw||'(empty ruleset)'));host.append(d)}if(!host.children.length)host.append(el('p','No firewall executables found. Install nftables and/or iptables on the target host.','muted'))}
-async function refresh(force=false){if(refreshing||(busy&&!force)||!key)return;refreshing=true;try{snapshot=await api('/api/overview');nft=snapshot.states.nft;ipt=snapshot.states[$('i-backend').value];overviewView();renderRules(nft,true);renderRules(ipt,false);$('updated').textContent='Last refreshed '+new Date().toLocaleString()+' | Rule counters are snapshots.'}finally{refreshing=false}}
-$('login').onsubmit=async e=>{e.preventDefault();key=$('key').value;try{status=await api('/api/status');$('key').value='';$('app').classList.remove('hidden');$('login').classList.add('hidden');setFirewallWritable(status.can_manage_firewall===true,status.read_only_reason||'');$('connection').textContent='Unlocked | '+(status.can_manage_firewall?'firewall access':'read-only');options($('i-backend'),status.backends.map(n=>[n,n]));const engines=[...(status.nft?[['nft','nftables']]:[]),...status.backends.map(n=>[n,n])];options($('m-engine'),engines);options($('raw-engine'),engines);options($('m-iface'),[['','Any interface'],...status.interfaces.filter(n=>n!=='lo').map(n=>[n,n])]);options($('p-iface'),[['','Any interface'],...status.interfaces.map(n=>[n,n])]);$('badges').replaceChildren();for(const [label,value]of [['IPv4 forwarding',status.forwarding.ip],['IPv6 forwarding',status.forwarding.ip6]])$('badges').append(el('span',label+': '+(value===null?'unknown':value?'on':'off'),'badge'));await refresh()}catch(err){key='';notice(err.message,true)}};
+function renderDetection(d){const previous=status.detection?.selected_backend;if(previous&&previous!==d.selected_backend){status.managerStateToken=null;status.pendingManagerStateToken=null;status.managerDrift=false} $('detection-summary').textContent=d.selection_review_required?'Detected backend changed from '+d.previous_backend+' to '+d.selected_backend+'. Explicit review is required before writes.':d.reason;const lines=['Selected backend: '+d.selected_backend,'UFW: '+d.managers.ufw.status+(d.managers.ufw.version?' ('+d.managers.ufw.version+')':''),'firewalld: '+d.managers.firewalld.status+(d.managers.firewalld.version?' ('+d.managers.firewalld.version+')':''),'Native nftables: '+d.direct.nftables.status+'; kernel backend: '+d.direct.nftables.underlying_packet_filter,'Direct iptables: '+d.direct.iptables.status+'; default implementation: '+d.direct.iptables.default_implementation,'Persistence: netfilter-persistent '+(d.persistence.netfilter_persistent.active===null?'unknown':d.persistence.netfilter_persistent.active?'active':'inactive')+'; native nft restore '+(d.persistence.native_restore.active===null?'unknown':d.persistence.native_restore.active?'active':'inactive'),'Other detected rule owners: '+(d.service_owners.length?d.service_owners.map(x=>x.service+(x.chains.length?': '+x.chains.join(', '):'')).join('; '):'none identified'),'Forwarding: IPv4 '+(d.forwarding.ipv4===null?'unknown':d.forwarding.ipv4?'on':'off')+', IPv6 '+(d.forwarding.ipv6===null?'unknown':d.forwarding.ipv6?'on':'off')];$('detection-details').textContent=lines.join('\n');status.detection=d;status.can_manage_firewall=d.can_write||d.manager_can_write;status.read_only_reason=d.selection_review_required?'The detected manager changed during this session; explicitly review the new selection before writing.':status.can_manage_firewall?'':(status.read_only_reason||d.reason);configureBackends();setFirewallWritable(status.can_manage_firewall,status.read_only_reason);$('ufw-controls').classList.toggle('hidden',d.selected_backend!=='ufw');$('firewalld-controls').classList.toggle('hidden',d.selected_backend!=='firewalld');$('connection').textContent='Unlocked | '+(status.can_manage_firewall?'selected manager: '+d.selected_backend:'read-only | '+d.selected_backend)}
+function configureBackends(){if(!status.detection)return;const d=status.detection,choices=d.selected_backend==='iptables'&&d.write_backends.length?d.write_backends:status.backends;options($('i-backend'),choices.map(n=>[n,n]));if(d.selected_backend==='iptables'){const modes=[];if(d.write_backends.includes('iptables'))modes.push(['default','System default']);if(d.write_backends.includes('iptables-nft'))modes.push(['nft','iptables-nft']);if(d.write_backends.includes('iptables-legacy'))modes.push(['legacy','iptables-legacy']);options($('i-port').elements.namedItem('mode'),modes)}}
+async function refresh(force=false){if(refreshing||(busy&&!force)||!key)return;refreshing=true;try{const previous=status.detection?.selected_backend,detection=await api('/api/detection');renderDetection(detection);if(previous&&previous!==detection.selected_backend)notice('Firewall manager changed from '+previous+' to '+detection.selected_backend+'. Writes were re-evaluated; review detection before continuing.',true);await refreshManager();configureBackends();snapshot=await api('/api/overview');nft=snapshot.states.nft;ipt=snapshot.states[$('i-backend').value];overviewView();renderRules(nft,true);renderRules(ipt,false);$('updated').textContent='Last refreshed '+new Date().toLocaleString()+' | Rule counters are snapshots.'}finally{refreshing=false}}
+function updateManagerToken(token){if(status.managerStateToken&&status.managerStateToken!==token){status.pendingManagerStateToken=token;status.managerDrift=true;status.read_only_reason='Manager configuration changed externally. Review the current rules before enabling controls.'}else if(!status.managerDrift)status.managerStateToken=token;setFirewallWritable(status.can_manage_firewall,status.read_only_reason)}
+async function refreshManager(){if(!key)return;const selected=status.detection?.selected_backend;if(selected==='ufw'){const d=await api('/api/ufw');updateManagerToken(d.state_token);$('ufw-status').textContent=d.status+'\nIPv6: '+(d.ipv6||'unknown');const host=$('ufw-rules');host.replaceChildren();for(const rule of d.rules){const row=el('div',`[${rule.number}] ${rule.text}`,'row between');const button=el('button','Delete','danger');button.disabled=!status.can_manage_firewall||status.managerDrift||status.detection.selection_review_required;button.onclick=()=>{if(confirm('Delete this UFW rule after revalidating its displayed number and text?\\n'+rule.text))change('/api/ufw/rule','DELETE',{number:rule.number,token:rule.token,state_token:status.managerStateToken})};row.append(button);host.append(row)}}else if(selected==='firewalld'){const d=await api('/api/firewalld');updateManagerToken(d.state_token);options($('firewalld-zone'),Object.keys(d.zones).map(zone=>[zone,zone]));$('firewalld-status').textContent='Default zone (informational only): '+(d.default_zone||'unknown')+'\\nActive zone bindings: '+JSON.stringify(d.active_zones)+'\\nRuntime/permanent zone rules:\\n'+JSON.stringify(d.zones,null,2)}}
+$('login').onsubmit=async e=>{e.preventDefault();key=$('key').value;try{status=await api('/api/status');$('key').value='';$('app').classList.remove('hidden');$('login').classList.add('hidden');renderDetection(status.detection);options($('i-backend'),status.backends.map(n=>[n,n]));const engines=[...(status.nft?[['nft','nftables']]:[]),...status.backends.map(n=>[n,n])];options($('m-engine'),engines);options($('raw-engine'),engines);options($('m-iface'),[['','Any interface'],...status.interfaces.filter(n=>n!=='lo').map(n=>[n,n])]);options($('p-iface'),[['','Any interface'],...status.interfaces.map(n=>[n,n])]);$('badges').replaceChildren();for(const [label,value]of [['IPv4 forwarding',status.forwarding.ip],['IPv6 forwarding',status.forwarding.ip6]])$('badges').append(el('span',label+': '+(value===null?'unknown':value?'on':'off'),'badge'));await refresh();try{await refreshManager()}catch(error){notice('Firewall manager status could not be refreshed: '+error.message,true)}}catch(err){key='';notice(err.message,true)}};
 $('logout').onclick=()=>{setSidebar(false,false);key='';snapshot=nft=ipt=null;$('app').classList.add('hidden');$('login').classList.remove('hidden');$('connection').textContent='Locked';clearInterval(timer);$('auto').value='0';$('all-views').replaceChildren();$('n-rules').replaceChildren();$('i-rules').replaceChildren();$('n-raw').textContent='';$('i-raw').textContent='';$('raw-out').textContent='Output appears here.';$('key').focus()};
 const sectionInfo={overview:['All Rules','A complete view of the firewall backends installed on this machine.'],nft:['nftables','Inspect native tables and chains, then add or remove individual rules.'],ipt:['iptables','Manage IPv4 and IPv6 rules using the backend you select.'],masq:['Masquerade','Configure source NAT for an outgoing interface and subnet.'],persistence:['Persistence','Save firewall changes and enable their restoration after boot.'],backups:['Backups','Keep a protected snapshot on the server or download your own copy.'],advanced:['Advanced','Run an explicit firewall command when you need more control.']};
 sectionInfo.display=['Display and Feel','Personalize theme, font, text size, and colors in this browser.'];
@@ -1079,6 +1735,11 @@ $('menu-toggle').onclick=()=>setSidebar(!$('app').classList.contains('sidebar-op
 document.addEventListener('keydown',e=>{if(!$('app').classList.contains('sidebar-open'))return;if(e.key==='Escape'){e.preventDefault();setSidebar(false)}else if(e.key==='Tab'){const first=document.querySelector('.tab.active'),last=$('sidebar-close');if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}}});
 window.addEventListener('hashchange',()=>activateTab(location.hash.slice(1),false));activateTab(location.hash.slice(1),false);initAppearance();
 $('refresh').onclick=()=>refresh().catch(e=>notice(e.message,true));$('auto').onchange=()=>{clearInterval(timer);if(+$('auto').value)timer=setInterval(()=>{if(!document.hidden&&!busy)refresh().catch(e=>notice(e.message,true))},+$('auto').value*1000)};
+$('refresh-detection').onclick=async()=>{try{const d=await api('/api/detection');renderDetection(d);await refreshManager();notice('Firewall detection refreshed. Review the selected backend before making changes.')}catch(e){notice(e.message,true)}};
+$('review-detection').onclick=async()=>{if(!confirm('Review the currently detected manager and rules, then allow future operations against this selection? No firewall settings will be changed.'))return;try{const r=await api('/api/detection/review','POST',{confirm:'REVIEW'});status.managerDrift=false;status.managerStateToken=null;renderDetection(r.detection);status.managerStateToken=r.detection.manager_state_token||null;status.read_only_reason='';await refreshManager();notice(r.message)}catch(e){notice(e.message,true)}};
+for(const [id,path]of [['ufw-add','/api/ufw/rule'],['ufw-default','/api/ufw/default'],['firewalld-add','/api/firewalld/rule']])$(id).onsubmit=e=>{e.preventDefault();const d=values(e.currentTarget);d.state_token=status.managerStateToken;if(id==='firewalld-add')d.zone=$('firewalld-zone').value;if(id==='ufw-add'&&!confirm('Apply this rule through UFW?'))return;change(path,'POST',d)};
+for(const [id,action,confirmText]of [['ufw-enable','enable','ENABLE'],['ufw-disable','disable','DISABLE'],['ufw-reload','reload','RELOAD']])$(id).onclick=()=>{const typed=prompt('Type '+confirmText+' to confirm the UFW '+action+' action.');if(typed===confirmText)change('/api/ufw/action','POST',{action,confirm:typed,state_token:status.managerStateToken})};
+$('firewalld-reload').onclick=()=>{if(prompt('Type RELOAD to apply permanent firewalld configuration.')==='RELOAD')change('/api/firewalld/reload','POST',{confirm:'RELOAD',state_token:status.managerStateToken})};
 for(const id of ['n-search','n-filter'])$(id).addEventListener('input',()=>renderRules(nft,true));for(const id of ['i-search','i-filter'])$(id).addEventListener('input',()=>renderRules(ipt,false));$('i-backend').onchange=()=>{ipt=snapshot?.states[$('i-backend').value];renderRules(ipt,false)};
 for(const [id,path]of [['n-add','/api/nft/rule'],['n-chain','/api/nft/chain'],['i-add','/api/iptables/rule'],['i-chain','/api/iptables/chain']])$(id).onsubmit=e=>{e.preventDefault();const d=values(e.currentTarget);if(id.startsWith('i-'))d.backend=$('i-backend').value;if((d.policy==='DROP'||d.policy==='drop')&&!confirm('A DROP policy can disconnect remote access. Continue?'))return;change(path,'POST',d)};
 $('i-port').onsubmit=e=>{e.preventDefault();const d=values(e.currentTarget);d.ipv4=$('p-ipv4').checked;d.ipv6=$('p-ipv6').checked;d.stateless=$('p-stateless').checked;if(!d.ipv4&&!d.ipv6){notice('Select IPv4, IPv6, or both.',true);return}const families=d.ipv4&&d.ipv6?'IPv4 + IPv6':d.ipv4?'IPv4':'IPv6';if(!confirm('Allow '+d.protocol.toUpperCase()+' service port '+d.port+' for '+families+' on '+(d.iface||'any interface')+'?\n'+(d.stateless?'Stateless: bypass connection tracking in both directions. NAT will not work for this traffic.':'Normal connection tracking (default).')))return;change('/api/iptables/port','POST',d)};
@@ -1093,17 +1754,44 @@ if __name__ == '__main__':
     if sys.argv[1:] == ['--restore-native']:
         if not can_manage_firewall():
             raise SystemExit('Native firewall restore requires root with CAP_NET_ADMIN.')
+        if os.environ.get('NFT_BACKEND', 'auto').strip().lower() not in ('auto', 'nftables'):
+            raise SystemExit('Native firewall restore cancelled by NFT_BACKEND selection.')
+        current = detect_firewall()
+        if current['active_managers'] or any(
+                manager['status'] == 'unknown' for manager in current['managers'].values()):
+            raise SystemExit('Native firewall restore cancelled: a manager is active or its state is unknown.')
         try:
             restore_native()
         except Exception as exc:
             raise SystemExit(f'Native firewall restore failed: {exc.message if isinstance(exc, Problem) else exc}')
         raise SystemExit(0)
+    args = sys.argv[1:]
+    if args in (['--help'], ['-h']):
+        print('Usage: firewall-web [--backend auto|ufw|firewalld|nftables|iptables|inspection] [--detect|--detect-json]')
+        print('Set NFT_BACKEND in the service environment to persist backend selection.')
+        raise SystemExit(0)
+    if args and args[0] == '--backend':
+        if len(args) < 2 or args[1] not in BACKEND_CHOICES:
+            raise SystemExit('Usage: firewall-web --backend auto|ufw|firewalld|nftables|iptables|inspection [--detect|--detect-json]')
+        os.environ['NFT_BACKEND'] = args[1]
+        args = args[2:]
+    report = current_detection()
+    if args in (['--detect'], ['--detect-json']):
+        if args == ['--detect-json']:
+            report['report_version'] = 1
+            print(json.dumps(report, sort_keys=True))
+        else:
+            print(f"Selected backend: {report['selected_backend']}\n{report['reason']}")
+        raise SystemExit(0)
+    if args:
+        raise SystemExit('Usage: firewall-web [--backend auto|ufw|firewalld|nftables|iptables|inspection] [--detect|--detect-json]')
     if not re.fullmatch(r'[0-9]{4}', SECRET):
         raise SystemExit('Set NFT_SECRET to an access key of exactly four digits. No default key is accepted.')
     try:
         from waitress import serve
     except ImportError:
         raise SystemExit('Install dependencies first: pip install flask waitress')
-    mode = 'firewall access' if can_manage_firewall() else 'read-only (' + read_only_reason() + ')'
+    mode = 'writable: ' + report['selected_backend'] if report['can_write'] else 'read-only: ' + report['reason']
+    print(f'[firewall_web] Detection: {mode}', flush=True)
     print(f'[firewall_web] Listening on {HOST}:{PORT}; {mode}.')
     serve(app, host=HOST, port=PORT, threads=4)

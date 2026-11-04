@@ -15,10 +15,9 @@ Depends:
  ${misc:Depends},
  python3 (>= 3.10),
  python3-flask (>= 2.0),
- python3-waitress (>= 2.0),
- iptables,
- nftables
+ python3-waitress (>= 2.0)
 Recommends: systemd
+Suggests: iptables, nftables
 Description: local web console for the Linux firewall
  View and manage nftables and IPv4/IPv6 iptables rules, configure masquerading,
  save backups, and explicitly configure boot-time persistence. Firewall

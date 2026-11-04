@@ -49,8 +49,9 @@ Version: $version
 Section: net
 Priority: optional
 Architecture: $architecture
-Depends: python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0), iptables, nftables
+Depends: python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0)
 Recommends: systemd
+Suggests: iptables, nftables
 Maintainer: Firewall Web contributors
 Homepage: https://github.com/arslandevpk/firewall-web
 Description: Local web console for the Linux firewall

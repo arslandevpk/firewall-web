@@ -50,5 +50,5 @@ apk mkpkg \
     --info "origin:firewall-web" \
     --info "url:https://github.com/arslandevpk/firewall-web" \
     --info "maintainer:Firewall Web contributors" \
-    --info "depends:python3 py3-flask py3-waitress iptables nftables openrc"
+    --info "depends:python3 py3-flask py3-waitress openrc"
 printf 'Built %s\n' "$output_dir/firewall-web_${version}_${architecture}.apk"
