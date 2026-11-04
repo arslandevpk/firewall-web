@@ -17,9 +17,9 @@ Depends:
  python3-flask (>= 2.0),
  python3-waitress (>= 2.0)
 Recommends: systemd
-Suggests: iptables, nftables
+Suggests: firewalld, iptables, nftables, ufw
 Description: local web console for the Linux firewall
- View and manage nftables and IPv4/IPv6 iptables rules, configure masquerading,
- save backups, and explicitly configure boot-time persistence. Firewall
- modifications require root with CAP_NET_ADMIN; without it, the authenticated
- web interface runs read-only.
+ Inspect and manage UFW, firewalld, nftables, and IPv4/IPv6 iptables through
+ their selected owning manager. Save backups and explicitly configure supported
+ boot persistence. Firewall modifications require root with CAP_NET_ADMIN;
+ without it, the authenticated web interface runs read-only.

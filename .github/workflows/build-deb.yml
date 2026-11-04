@@ -6,7 +6,7 @@ on:
       version:
         description: Debian package version (for example, 1.2.3)
         required: true
-        default: "1.0.2"
+        default: "1.0.3"
         type: string
 
 permissions:
@@ -30,6 +30,15 @@ jobs:
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
         run: packaging/build-deb.sh "$PACKAGE_VERSION"
+      - name: Generate and verify SHA-256 checksum
+        env:
+          PACKAGE_ARCHITECTURE: ${{ matrix.architecture }}
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          package="firewall-web_${PACKAGE_VERSION}_${PACKAGE_ARCHITECTURE}.deb"
+          cd dist
+          sha256sum "$package" > "$package.sha256"
+          sha256sum --check "$package.sha256"
       - name: Install package and verify service
         env:
           PACKAGE_ARCHITECTURE: ${{ matrix.architecture }}
@@ -80,7 +89,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: firewall-web_${{ inputs.version }}_${{ matrix.architecture }}
-          path: dist/firewall-web_${{ inputs.version }}_${{ matrix.architecture }}.deb
+          path: |
+            dist/firewall-web_${{ inputs.version }}_${{ matrix.architecture }}.deb
+            dist/firewall-web_${{ inputs.version }}_${{ matrix.architecture }}.deb.sha256
           if-no-files-found: error
           retention-days: 30
 

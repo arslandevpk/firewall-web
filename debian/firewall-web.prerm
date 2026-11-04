@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ] && [ -e /etc/systemd/system/nft-web-restore.service ]; then
+    echo "Refusing to remove firewall-web while nft-web-restore.service depends on its code. Migrate or explicitly remove that restore configuration first; firewall rules and saved state were not changed." >&2
+    exit 1
+fi
+
+#DEBHELPER#

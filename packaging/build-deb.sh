@@ -51,13 +51,13 @@ Priority: optional
 Architecture: $architecture
 Depends: python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0)
 Recommends: systemd
-Suggests: iptables, nftables
+Suggests: firewalld, iptables, nftables, ufw
 Maintainer: Firewall Web contributors
 Homepage: https://github.com/arslandevpk/firewall-web
 Description: Local web console for the Linux firewall
- View and manage nftables and IPv4/IPv6 iptables rules, configure masquerading,
- save backups, and explicitly configure boot-time persistence. Install and run
- as root; the service administers this host's live firewall.
+ Inspect and manage UFW, firewalld, nftables, and IPv4/IPv6 iptables through
+ their selected owning manager. Save backups and explicitly configure supported
+ boot persistence. Install and run as root to administer this host's firewall.
 EOF
 
 cat > "$package_dir/DEBIAN/conffiles" <<'EOF'
@@ -75,6 +75,10 @@ EOF
 cat > "$package_dir/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
+if [ "$1" = remove ] && [ -e /etc/systemd/system/nft-web-restore.service ]; then
+    echo "Refusing to remove firewall-web while nft-web-restore.service depends on its code. Migrate or explicitly remove that restore configuration first; firewall rules and saved state were not changed." >&2
+    exit 1
+fi
 if [ "$1" = remove ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet firewall-web.service || systemctl is-enabled --quiet firewall-web.service; then
         systemctl disable --now firewall-web.service

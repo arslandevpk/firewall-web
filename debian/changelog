@@ -1,8 +1,7 @@
-firewall-web (1.0.2-1) unstable; urgency=medium
+firewall-web (1.0.3-1) unstable; urgency=medium
 
-  * Add Debian source packaging and run-time compatibility for constrained
-    Linux userspaces.
-  * Keep firewall mutations gated on root and CAP_NET_ADMIN.
-  * Bundle font assets with their original licenses.
+  * Add native UFW/firewalld management, drift detection, and bounded rollback.
+  * Preserve standalone/package configuration and add safe lifecycle handling.
+  * Add Firewall Manager navigation and privileged integration coverage.
 
  -- arslandevpk <arslandevpk@users.noreply.github.com>  Thu, 29 Oct 2026 18:05:24 +0000

@@ -29,10 +29,18 @@ FIRST INSTALL
 Unzip the archive and enter its firewall-web-standalone directory, then run:
   sudo bash install.sh
 Enter your OWN four-digit PIN. Leading zeros are supported. No PIN is shipped.
-The installer refuses to overwrite an existing installation. It creates a venv,
-installs application dependencies, runs read-only manager detection, writes a
-root-only environment file, and enables the firewall-web.service service, which
-runs the utility as root. No firewall rules or policies are changed at startup.
+The installer creates a venv, installs application dependencies, runs
+read-only manager detection before configuring the service, writes a root-only
+environment file, and enables firewall-web.service, which runs the utility as
+root. No firewall rules or policies are changed at startup.
+Use `sudo bash install.sh --upgrade` for an idempotent application upgrade; it
+preserves the PIN, backend choice, service enablement, and local configuration.
+Pass `--backend` only to deliberately change the saved backend selection.
+Use `sudo bash install.sh --uninstall` to remove the standalone app; its
+configuration, backups, and firewall rules are preserved. Uninstall refuses
+while nft-web-restore.service depends on the application code. Resolve or
+migrate that native restore configuration explicitly first. Stop a foreground
+process manually before uninstalling from a non-systemd environment.
 
 DEBIAN PACKAGE ARTIFACTS
 Run the "Build Debian and Alpine packages" workflow from the GitHub Actions
@@ -96,38 +104,100 @@ Select a backend for one CLI invocation with:
   firewall-web --backend auto|ufw|firewalld|nftables|iptables|inspection --detect
 Set NFT_BACKEND in the service environment to keep a selection across restarts
 and upgrades. auto selects active UFW or firewalld before considering direct
-rulesets. Conflicting active managers, unknown state, competing populated
-direct backends, and an empty host default to inspection-only. An incompatible
-override is rejected rather than silently taking over another manager.
+rulesets. Unknown state, competing populated direct backends, and an empty host
+default to inspection-only. Two simultaneously active native managers also
+default to inspection-only; an administrator may deliberately select one with
+the exact acknowledgement returned as `conflict_acknowledgement` by
+`firewall-web --detect-json`. For example:
+  sudo firewall-web --backend ufw --acknowledge-conflict active-managers:firewalld,ufw --detect
+For installation, pass the same value to `install.sh --acknowledge-conflict`.
+Set `NFT_BACKEND_ACK` to that exact value in the service environment to persist
+the deliberate choice. Acknowledgement only selects one active manager for
+manager-owned operations; it never disables, flushes, migrates, or enables
+another manager or its persistence. Other incompatible overrides fail closed.
+When no firewall is active, choose and configure UFW, firewalld, native
+nftables, or iptables yourself using the platform's supported administration
+tools, then refresh discovery. Firewall Web never activates filtering or
+changes default policies as an installation side effect.
 
-UFW mode supports adding allow/deny/reject/limit port rules with optional
-source networks and comments, changing default policies, deleting numbered
-rules after stale-state revalidation, and explicitly enabling, disabling, or
-reloading UFW. IPv4/IPv6 behavior and boot persistence remain UFW-owned.
-firewalld mode supports services and ports in an explicitly selected zone, with
-runtime and permanent configuration kept separate, plus an explicit reload.
-The current UI does not yet expose firewalld source/interface bindings or rich
-rules. Direct nftables/iptables editors and direct persistence controls are
-disabled whenever UFW or firewalld owns the active firewall.
+UFW mode supports host and route allow/deny/reject/limit rules, route interface
+bindings, source/destination networks and ports, direction, protocol, and
+comments where UFW supports them. Route `limit` is unsupported and rejected.
+It also supports defaults, stale-checked numbered deletion, and explicit
+enable/disable/reload. IPv4/IPv6 behavior and persistence remain UFW-owned.
+Deletion and access-risking changes have a 90-second keep-or-auto-rollback
+window. The rollback worker can outlive the web process; if manager state
+changed concurrently, it skips the inverse and records a conflict rather than
+overwriting the new state.
+
+firewalld mode supports services, ports, source/interface zone bindings,
+supported policies, and rich rules. Choose an existing zone or policy
+explicitly; no zone is assumed. Runtime and permanent changes are separate.
+Permanent operations update only the selected object, and an explicit reload
+applies saved permanent configuration. Unsupported controls are disabled and
+rejected by the API according to detected firewalld capabilities. A reload is
+not selectively rolled back because it replaces runtime manager state; review
+the effect and retain console access before applying it. Direct nftables/
+iptables editors and persistence controls are disabled when UFW or firewalld
+owns the selected backend.
 
 Unattended standalone installation uses `--non-interactive` and requires
 `NFT_SECRET` in the environment. Backend selection can be supplied with
-`--backend`; `--dry-run` prints the machine-readable detection report without
-changing packages, configuration, services, or firewall state (system Python
+`--backend`; ambiguous unattended auto-selection is saved as inspection-only.
+`--dry-run` prints the read-only discovery report without changing packages,
+configuration, services, or firewall state (the selected Python interpreter
 must already be able to import Flask). Add `--json` for stable JSON output.
+`--upgrade` preserves the existing PIN and backend policy; `--uninstall`
+preserves configuration/backups and refuses to orphan an enabled native nft
+restore unit.
 Example:
   sudo NFT_SECRET=1234 bash install.sh --backend auto --non-interactive
   sudo bash install.sh --dry-run --backend auto --json
 
-Manager state is re-detected before each write. UFW numbered deletions and
-firewalld manager changes also use configuration tokens that exclude packet
-counters and reject stale browser state. The application cannot lock out other
-processes from writing concurrently; an external command can still race the
-final validation and manager command. Firewall Web does not yet provide a
-durable selective rollback for remote-access changes. Keep console access when
-changing policies or enabling/disabling a manager. Explicitly app-created
-manager or direct rules are left in place when the web application is removed;
-uninstallation does not flush rules or disable other persistence services.
+Manager ownership and the counter/handle-independent fingerprint are polled
+and re-detected before every mutation. Changes from external UFW/firewalld,
+nftables/iptables commands, manager restarts, and persistence-service changes
+pause writes until the administrator reviews the current state. Rule-specific
+tokens reject stale selections. Mutations are serialized within this process;
+external CLI writers cannot be locked out, and a residual race exists between
+the final revalidation and the manager command.
+
+Access-risking UFW changes and firewalld rule changes use a bounded, durable
+90-second keep-or-rollback flow. The rollback only executes its targeted
+inverse if the manager still matches the expected post-operation state. If
+another change occurs, it records a conflict and leaves the current manager
+configuration untouched. Keep console access for all firewall changes.
+Ordinary application removal never flushes firewall state or disables another
+service. UFW/firewalld rules remain under those managers. Direct nftables
+restore service state must be explicitly migrated or removed before uninstall,
+so removing the code cannot silently break boot persistence.
+
+PRIVILEGED MANAGER INTEGRATION TESTS
+Run `packaging/test-firewall-manager-integration.sh` on a machine with Docker.
+It installs UFW and firewalld in separate containers using bridge networking
+and `CAP_NET_ADMIN`; it never uses host networking or changes the host firewall.
+The test exercises native status, route/binding/rich/policy operations,
+runtime/permanent separation, reload, external drift, rule rollback after the
+web process exits, rollback conflict preservation, unrelated rules, and a
+selective native nft restore that leaves an unrelated table intact.
+Docker does not boot a separate systemd VM, so these checks do not prove actual
+reboot survival or systemd timer behavior. Run the same script in a disposable
+privileged VM with systemd and reboot it to verify those lifecycle cases.
+Run `packaging/test-installer-lifecycle.sh` for an isolated standalone install,
+dry-run immutability, upgrade-preservation, and uninstall-guard check. Run
+`packaging/test-deb-lifecycle.sh` to verify Debian package upgrades, preserved
+configuration/data, and the native-restore uninstall guard. These scripts
+require Docker and network access to their package repositories.
+For reboot verification, use a disposable systemd VM with a console and a
+snapshot; never run firewall integration tests on a development or production
+host. Install one manager per test VM, install/enable the app only after
+reviewing detection, add a separate sentinel rule owned outside Firewall Web,
+then exercise native manager changes through the UI/API. Verify the manager's
+status and the sentinel rule, run its supported reload, reboot the VM, and
+repeat both checks. Test UFW and firewalld in separate VM snapshots. The Docker
+harness above verifies manager status, reload, rollback, and unrelated-rule
+preservation, but does not boot systemd, enable real boot-persistence services,
+or prove reboot survival.
 
 ACCESS
 For firewall changes, run the utility as root with CAP_NET_ADMIN. The UI can run

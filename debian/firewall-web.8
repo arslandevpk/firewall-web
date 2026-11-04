@@ -1,4 +1,4 @@
-.TH FIREWALL-WEB 8 "October 2026" "firewall-web 1.0.2" "System Administration"
+.TH FIREWALL-WEB 8 "November 2026" "firewall-web 1.0.3" "System Administration"
 .SH NAME
 firewall-web \- local web console for the Linux firewall
 .SH SYNOPSIS
@@ -8,6 +8,34 @@ firewall-web \- local web console for the Linux firewall
 starts the authenticated local web interface on the configured address and port.
 The installed launcher reads its settings from
 .IR /etc/firewall-web/firewall-web.env .
+At startup the application performs read-only firewall discovery and selects
+the owning manager, or remains inspection-only when ownership is ambiguous.
+Use
+.B firewall-web --detect
+for a human-readable report or
+.B firewall-web --detect-json
+for a versioned machine-readable report.
+.PP
+Set
+.B NFT_BACKEND
+to
+.BR auto ,
+.BR ufw ,
+.BR firewalld ,
+.BR nftables ,
+.BR iptables ,
+or
+.B inspection
+to choose a persistent backend policy. Conflicting active UFW and firewalld
+instances remain inspection-only unless an administrator selects one manager
+and sets
+.B NFT_BACKEND_ACK
+to the exact
+.B conflict_acknowledgement
+shown by
+.BR --detect-json .
+Acknowledgement does not disable, flush, migrate, or change persistence for
+another manager.
 .PP
 The default listener is
 .BR 127.0.0.1:5005 .
