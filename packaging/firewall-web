@@ -5,7 +5,14 @@ if [ ! -r "$config" ] && [ -r /etc/conf.d/firewall-web ]; then
 	config=/etc/conf.d/firewall-web
 fi
 [ -r "$config" ] || { echo "Missing firewall-web configuration: $config" >&2; exit 1; }
-set -a
-. "$config"
-set +a
-exec /usr/bin/python3 /usr/lib/firewall-web/firewall_web.py "$@"
+if [ -x /opt/firewall-web/venv/bin/python ] && [ -f /opt/firewall-web/firewall_web.py ]; then
+	python=/opt/firewall-web/venv/bin/python
+	app=/opt/firewall-web/firewall_web.py
+	helper=/opt/firewall-web/firewall-web-config.py
+else
+	python=/usr/bin/python3
+	app=/usr/lib/firewall-web/firewall_web.py
+	helper=/usr/lib/firewall-web/firewall-web-config.py
+fi
+[ -r "$helper" ] || { echo "Missing firewall-web configuration helper: $helper" >&2; exit 1; }
+exec "$python" "$helper" exec --config "$config" -- "$python" "$app" "$@"

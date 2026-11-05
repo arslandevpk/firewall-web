@@ -36,12 +36,17 @@ install -m 644 "$app_dir/firewall_web.py" "$package_dir/usr/lib/firewall-web/"
 install -m 644 "$app_dir"/fonts/*.woff2 "$app_dir"/fonts/*.ttf "$package_dir/usr/lib/firewall-web/fonts/"
 install -m 644 "$app_dir"/fonts/licenses/* "$package_dir/usr/lib/firewall-web/fonts/licenses/"
 install -m 755 "$script_dir/firewall-web" "$package_dir/usr/bin/firewall-web"
-install -m 644 "$app_dir/firewall-web.env.example" "$package_dir/etc/firewall-web/firewall-web.env"
+install -m 755 "$script_dir/firewall-web-config.py" "$package_dir/usr/lib/firewall-web/firewall-web-config.py"
+install -m 755 "$script_dir/debian-postinst" "$package_dir/usr/lib/firewall-web/debian-postinst"
+install -m 644 "$script_dir/firewall-web.env.debian" "$package_dir/etc/firewall-web/firewall-web.env"
 chmod 600 "$package_dir/etc/firewall-web/firewall-web.env"
 install -m 644 "$script_dir/firewall-web.service" "$package_dir/usr/lib/systemd/system/firewall-web.service"
 install -m 644 "$app_dir/README.txt" "$package_dir/usr/share/doc/firewall-web/README"
+install -m 644 "$app_dir/firewall-web.env.example" "$package_dir/usr/share/doc/firewall-web/firewall-web.env.example"
 install -m 644 "$repo_root/LICENSE" "$package_dir/usr/share/doc/firewall-web/LICENSE"
 install -m 644 "$repo_root/debian/copyright" "$package_dir/usr/share/doc/firewall-web/copyright"
+gzip -n -9 -c "$repo_root/debian/changelog" > "$package_dir/usr/share/doc/firewall-web/changelog.gz"
+chmod 644 "$package_dir/usr/share/doc/firewall-web/changelog.gz"
 
 cat > "$package_dir/DEBIAN/control" <<EOF
 Package: firewall-web
@@ -49,10 +54,9 @@ Version: $version
 Section: net
 Priority: optional
 Architecture: $architecture
-Depends: python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0)
+Depends: debconf (>= 0.5) | debconf-2.0, python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0)
 Recommends: systemd
-Suggests: firewalld, iptables, nftables, ufw
-Maintainer: Firewall Web contributors
+Maintainer: arslandevpk <arslandevpk@users.noreply.github.com>
 Homepage: https://github.com/arslandevpk/firewall-web
 Description: Local web console for the Linux firewall
  Inspect and manage UFW, firewalld, nftables, and IPv4/IPv6 iptables through
@@ -63,13 +67,20 @@ EOF
 cat > "$package_dir/DEBIAN/conffiles" <<'EOF'
 /etc/firewall-web/firewall-web.env
 EOF
+command -v po2debconf >/dev/null 2>&1 || {
+  echo "po-debconf is required to build the Debian package." >&2
+  exit 1
+}
+po2debconf "$repo_root/debian/templates" |
+  sed -e 's/^description:/Description:/' -e 's/^choices:/Choices:/' -e 's/^default:/Default:/' \
+    > "$package_dir/DEBIAN/templates"
+chmod 644 "$package_dir/DEBIAN/templates"
+install -m 755 "$repo_root/debian/config" "$package_dir/DEBIAN/config"
 
 cat > "$package_dir/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
-if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload
-fi
+/usr/lib/firewall-web/debian-postinst "$@"
 EOF
 
 cat > "$package_dir/DEBIAN/prerm" <<'EOF'
@@ -89,8 +100,14 @@ EOF
 cat > "$package_dir/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
+. /usr/share/debconf/confmodule
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
+fi
+if [ "$1" = purge ]; then
+    db_purge
+    rm -f /var/lib/firewall-web/initial-pin
+    rmdir --ignore-fail-on-non-empty /var/lib/firewall-web 2>/dev/null || true
 fi
 EOF
 

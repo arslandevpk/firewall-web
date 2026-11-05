@@ -1,0 +1,286 @@
+#!/bin/sh
+set -eu
+. /usr/share/debconf/confmodule
+
+config=/etc/firewall-web/firewall-web.env
+helper=/usr/lib/firewall-web/firewall-web-config.py
+old_version=${2:-}
+reconfigure=false
+if [ "${DEBCONF_RECONFIGURE:-}" = 1 ]; then
+    reconfigure=true
+fi
+
+clear_debconf_secret() {
+    db_set firewall-web/secret "" >/dev/null 2>&1 || true
+    db_fset firewall-web/secret seen false >/dev/null 2>&1 || true
+}
+trap clear_debconf_secret EXIT
+
+read_answer() {
+    if db_get "firewall-web/$1"; then
+        printf '%s' "$RET"
+        return 0
+    fi
+    case "$1" in
+        host) printf '127.0.0.1' ;;
+        port) printf '5005' ;;
+        secret) printf '' ;;
+        backend) printf 'auto' ;;
+        start-service) printf 'true' ;;
+        *) return 1 ;;
+    esac
+}
+
+policy_denies() {
+    action=$1
+    [ -x /usr/sbin/policy-rc.d ] || return 1
+    if /usr/sbin/policy-rc.d firewall-web.service "$action" >/dev/null 2>&1; then
+        return 1
+    else
+        policy_status=$?
+    fi
+    [ "$policy_status" -eq 101 ]
+}
+
+invoke_service() {
+    action=$1
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke "$action" firewall-web.service
+    else
+        systemctl "$action" firewall-web.service
+    fi
+}
+
+if [ "$reconfigure" = true ]; then
+    host=$(read_answer host)
+    port=$(read_answer port)
+    secret=$(read_answer secret)
+    backend=$(read_answer backend)
+    acknowledgement=$(/usr/bin/python3 "$helper" read --config "$config" NFT_BACKEND_ACK 2>/dev/null || true)
+    printf '%s\n' "$host" "$port" "$secret" "$backend" "$acknowledgement" |
+        /usr/bin/python3 "$helper" apply --config "$config" --mode reconfigure
+elif [ -z "$old_version" ] || [ ! -e "$config" ]; then
+    host=$(read_answer host)
+    port=$(read_answer port)
+    secret=$(read_answer secret)
+    backend=$(read_answer backend)
+    acknowledgement=$(/usr/bin/python3 "$helper" read --config "$config" NFT_BACKEND_ACK 2>/dev/null || true)
+    printf '%s\n' "$host" "$port" "$secret" "$backend" "$acknowledgement" |
+        /usr/bin/python3 "$helper" apply --config "$config" --mode initial
+else
+    if /usr/bin/python3 "$helper" validate --config "$config" >/dev/null 2>&1; then
+        /usr/bin/python3 "$helper" secure --config "$config"
+    else
+        host=$(read_answer host)
+        port=$(read_answer port)
+        secret=$(read_answer secret)
+        backend=$(read_answer backend)
+        acknowledgement=$(/usr/bin/python3 "$helper" read --config "$config" NFT_BACKEND_ACK 2>/dev/null || true)
+        if ! /usr/bin/python3 "$helper" validate-value NFT_BACKEND_ACK "$acknowledgement" >/dev/null 2>&1; then
+            acknowledgement=
+        fi
+        printf '%s\n' "$host" "$port" "$secret" "$backend" "$acknowledgement" |
+            /usr/bin/python3 "$helper" apply --config "$config" --mode initial
+    fi
+fi
+
+/usr/bin/python3 "$helper" validate --config "$config" >/dev/null
+clear_debconf_secret
+
+deferred_reason=
+start_requested=false
+enabled_by_installer=false
+if [ "$reconfigure" = true ]; then
+    start_requested=true
+elif [ -z "$old_version" ]; then
+    start_value=$(read_answer start-service)
+    [ "$start_value" = true ] && start_requested=true
+fi
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    unit_state=$(systemctl is-enabled firewall-web.service 2>/dev/null || true)
+    was_active=false
+    if systemctl is-active --quiet firewall-web.service; then
+        was_active=true
+    fi
+
+    if [ "$unit_state" = masked ] || [ "$unit_state" = masked-runtime ]; then
+        deferred_reason="the service unit is masked; it was not unmasked or started"
+    elif [ "$reconfigure" = true ] && [ "$was_active" = true ]; then
+        if policy_denies restart; then
+            deferred_reason="policy-rc.d denied service restart"
+        else
+            if ! invoke_service restart; then
+                echo "Failed to restart firewall-web.service. Diagnose with: systemctl status firewall-web.service; journalctl -u firewall-web.service -n 100 --no-pager" >&2
+                exit 1
+            fi
+        fi
+    elif [ -n "$old_version" ] && [ "$was_active" = true ]; then
+        if policy_denies restart; then
+            deferred_reason="policy-rc.d denied service restart"
+        else
+            if ! invoke_service restart; then
+                echo "Failed to restart firewall-web.service. Diagnose with: systemctl status firewall-web.service; journalctl -u firewall-web.service -n 100 --no-pager" >&2
+                exit 1
+            fi
+        fi
+    elif [ -z "$old_version" ] && [ "$start_requested" = true ]; then
+        if policy_denies start; then
+            deferred_reason="policy-rc.d denied service startup"
+        else
+            if command -v deb-systemd-helper >/dev/null 2>&1; then
+                if ! deb-systemd-helper enable firewall-web.service >/dev/null; then
+                    echo "Could not enable firewall-web.service." >&2
+                    exit 1
+                fi
+            else
+                if ! systemctl enable firewall-web.service; then
+                    echo "Could not enable firewall-web.service." >&2
+                    exit 1
+                fi
+            fi
+            case "$unit_state" in enabled|enabled-runtime|linked|linked-runtime|static|indirect) ;;
+                *) enabled_by_installer=true ;;
+            esac
+            if ! invoke_service start; then
+                if [ "$enabled_by_installer" = true ]; then
+                    if command -v deb-systemd-helper >/dev/null 2>&1; then
+                        deb-systemd-helper disable firewall-web.service >/dev/null 2>&1 || true
+                    else
+                        systemctl disable firewall-web.service >/dev/null 2>&1 || true
+                    fi
+                fi
+                echo "Failed to start firewall-web.service. Diagnose with: systemctl status firewall-web.service; journalctl -u firewall-web.service -n 100 --no-pager" >&2
+                exit 1
+            fi
+        fi
+    elif [ -z "$old_version" ]; then
+        deferred_reason="service startup was disabled by the installation choice"
+    elif [ "$reconfigure" = true ]; then
+        deferred_reason="the service was stopped before reconfiguration and remains stopped"
+    else
+        deferred_reason="the service was stopped before the upgrade and remains stopped"
+    fi
+
+    if [ -z "$deferred_reason" ]; then
+        if ! systemctl is-active --quiet firewall-web.service; then
+            if policy_denies start; then
+                deferred_reason="policy-rc.d denied service startup"
+            else
+                echo "Firewall Web failed to become active. Diagnose with: systemctl status firewall-web.service; journalctl -u firewall-web.service -n 100 --no-pager" >&2
+                exit 1
+            fi
+        fi
+    fi
+
+    if [ -z "$deferred_reason" ]; then
+        ready=false
+        attempt=0
+        while [ "$attempt" -lt 30 ]; do
+            if systemctl is-active --quiet firewall-web.service &&
+                /usr/bin/python3 "$helper" ready --config "$config"; then
+                ready=true
+                break
+            fi
+            attempt=$((attempt + 1))
+            sleep 1
+        done
+        if [ "$ready" != true ]; then
+            if [ "$enabled_by_installer" = true ]; then
+                if command -v deb-systemd-helper >/dev/null 2>&1; then
+                    deb-systemd-helper disable firewall-web.service >/dev/null 2>&1 || true
+                else
+                    systemctl disable firewall-web.service >/dev/null 2>&1 || true
+                fi
+            fi
+            echo "Firewall Web did not become ready within 30 seconds. Diagnose with: systemctl status firewall-web.service; journalctl -u firewall-web.service -n 100 --no-pager" >&2
+            exit 1
+        fi
+    fi
+else
+    deferred_reason="no running systemd instance is available"
+fi
+
+backend_report=$(firewall-web --detect-json)
+backend_summary=$(printf '%s\n' "$backend_report" | /usr/bin/python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+selected = d["selected_backend"]
+if selected == "inspection":
+    mode = "inspection-only"
+elif d["can_write"] or d["manager_can_write"]:
+    mode = "writable"
+else:
+    mode = "read-only (insufficient host capability)"
+print(f"{selected} ({mode})")
+')
+version=$(dpkg-query -W -f='${Version}' firewall-web 2>/dev/null || echo unknown)
+host=$(/usr/bin/python3 "$helper" read --config "$config" NFT_HOST)
+port=$(/usr/bin/python3 "$helper" read --config "$config" NFT_PORT)
+case "$host" in
+    0.0.0.0)
+        access_url="http://127.0.0.1:$port"
+        access_note="Wildcard listener: use the local URL above here; use a secured tunnel for remote access. No firewall port was opened."
+        ;;
+    ::)
+        access_url="http://[::1]:$port"
+        access_note="Wildcard listener: use the local URL above here; use a secured tunnel for remote access. No firewall port was opened."
+        ;;
+    ::1) access_url="http://[::1]:$port"; access_note="This is a localhost-only listener; use an SSH tunnel for remote access." ;;
+    127.*|localhost) access_url="http://127.0.0.1:$port"; access_note="This is a localhost-only listener; use an SSH tunnel for remote access." ;;
+    *:*) access_url="http://[$host]:$port"; access_note="No firewall port was opened; remote reachability depends on existing network policy." ;;
+    *) access_url="http://$host:$port"; access_note="No firewall port was opened; remote reachability depends on existing network policy." ;;
+esac
+service_state=not-running
+boot_state=unknown
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    service_state=$(systemctl is-active firewall-web.service 2>/dev/null || true)
+    [ -n "$service_state" ] || service_state=inactive
+    boot_state=$(systemctl is-enabled firewall-web.service 2>/dev/null || true)
+    [ -n "$boot_state" ] || boot_state=unknown
+fi
+
+printf '\nFirewall Web %s installed.\n' "$version"
+printf 'Selected backend: %s\n' "$backend_summary"
+printf 'Service state: %s; boot start: %s\n' "$service_state" "$boot_state"
+printf 'Configuration: %s (root-owned, mode 0600)\n' "$config"
+printf 'Access URL: %s\n%s\n' "$access_url" "$access_note"
+if [ -f /var/lib/firewall-web/initial-pin ]; then
+    printf 'A generated PIN is stored root-only in /var/lib/firewall-web/initial-pin; retrieve it securely and then remove that file.\n'
+fi
+printf 'Edit settings: sudoedit %s\n' "$config"
+printf 'Restart: sudo systemctl restart firewall-web.service\n'
+printf 'Status: sudo systemctl status firewall-web.service\n'
+printf 'Recent logs: sudo journalctl -u firewall-web.service -n 100 --no-pager\n'
+if [ -n "$deferred_reason" ]; then
+    printf 'Startup deferred: %s.\n' "$deferred_reason"
+    case "$deferred_reason" in
+        "no running systemd instance is available")
+            printf 'Run in the foreground when appropriate: sudo firewall-web\n'
+            ;;
+        "the service was stopped before the upgrade and remains stopped" | \
+        "the service was stopped before reconfiguration and remains stopped")
+            printf 'Start manually when appropriate: sudo systemctl start firewall-web.service\n'
+            ;;
+        "the service unit is masked; it was not unmasked or started")
+            printf 'After choosing to unmask it: sudo systemctl unmask firewall-web.service && sudo systemctl enable --now firewall-web.service\n'
+            ;;
+        "policy-rc.d denied service restart")
+            printf 'After the policy permits it: sudo systemctl restart firewall-web.service\n'
+            ;;
+        "policy-rc.d denied service startup")
+            printf 'After the policy permits it: sudo systemctl enable --now firewall-web.service\n'
+            ;;
+        *)
+            printf 'After resolving the deferral, start when appropriate: sudo systemctl enable --now firewall-web.service\n'
+            ;;
+    esac
+fi
+
+if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != dumb ]; then
+    printf '\033[1;4mHAPPY FIREWALLING!\033[0m\n'
+else
+    printf 'HAPPY FIREWALLING!\n'
+fi
+exit 0

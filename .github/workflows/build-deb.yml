@@ -6,13 +6,56 @@ on:
       version:
         description: Debian package version (for example, 1.2.3)
         required: true
-        default: "1.0.3"
+        default: "1.0.4"
         type: string
 
 permissions:
   contents: read
 
 jobs:
+  browser:
+    name: Browser navigation regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install application and browser-test dependencies
+        run: |
+          python -m venv firewall-web-standalone/.venv
+          firewall-web-standalone/.venv/bin/python -m pip install -r firewall-web-standalone/requirements.txt
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run desktop and mobile browser tests
+        run: npm run test:browser
+      - name: Upload browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firewall-web-browser-failures
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  install-lifecycle:
+    name: Isolated installation lifecycle tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test configuration validation and PIN handling
+        run: python3 packaging/test_firewall_web_config.py
+      - name: Test standalone install, upgrade, dry-run, and uninstall
+        run: packaging/test-installer-lifecycle.sh
+      - name: Test Debian debconf install, upgrade, remove, and purge
+        run: packaging/test-deb-lifecycle.sh
+
   build:
     name: Build ${{ matrix.architecture }}
     strategy:
@@ -29,7 +72,10 @@ jobs:
       - name: Build package
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
-        run: packaging/build-deb.sh "$PACKAGE_VERSION"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends po-debconf
+          packaging/build-deb.sh "$PACKAGE_VERSION"
       - name: Generate and verify SHA-256 checksum
         env:
           PACKAGE_ARCHITECTURE: ${{ matrix.architecture }}
@@ -39,32 +85,14 @@ jobs:
           cd dist
           sha256sum "$package" > "$package.sha256"
           sha256sum --check "$package.sha256"
-      - name: Install package and verify service
+      - name: Verify package metadata
         env:
           PACKAGE_ARCHITECTURE: ${{ matrix.architecture }}
           PACKAGE_VERSION: ${{ inputs.version }}
         run: |
           package="./dist/firewall-web_${PACKAGE_VERSION}_${PACKAGE_ARCHITECTURE}.deb"
           test "$(dpkg-deb --field "$package" Architecture)" = "$PACKAGE_ARCHITECTURE"
-          sudo apt-get update
-          sudo apt-get install -y "$package"
-          sudo sed -i 's/^NFT_SECRET=.*/NFT_SECRET=1234/' /etc/firewall-web/firewall-web.env
-          sudo systemctl enable --now firewall-web.service
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent --show-error http://127.0.0.1:5005/ >/dev/null; then
-              break
-            fi
-            if [ "$attempt" -eq 30 ]; then
-              sudo journalctl -u firewall-web.service --no-pager
-              exit 1
-            fi
-            sleep 1
-          done
-          curl --fail --silent --show-error \
-            -H 'X-Secret: 1234' \
-            http://127.0.0.1:5005/api/status |
-            python3 -c 'import json,sys; status=json.load(sys.stdin); assert status["root"] is True; print("Service responds as root; detected nftables:", status["nft"])'
-          sudo systemctl is-active --quiet firewall-web.service
+          test -z "$(dpkg-deb --field "$package" Suggests)"
       - name: Test package in latest Ubuntu and Debian userspaces
         env:
           PACKAGE_ARCHITECTURE: ${{ matrix.architecture }}
@@ -72,7 +100,7 @@ jobs:
         run: |
           package="$PWD/dist/firewall-web_${PACKAGE_VERSION}_${PACKAGE_ARCHITECTURE}.deb"
           for image in ubuntu:latest debian:stable-slim; do
-            docker run --rm --network host \
+            docker run --rm --network bridge \
               -v "$PWD:/repo" \
               -v "$package:/tmp/firewall-web.deb:ro" \
               "$image" sh -ec '
@@ -117,7 +145,7 @@ jobs:
             -v "$PWD:/repo" -w /repo alpine:latest \
             sh -ec 'packaging/build-apk.sh "$PACKAGE_VERSION" "$APK_ARCH"'
           package="$PWD/dist/firewall-web_${PACKAGE_VERSION}_${APK_ARCH}.apk"
-          docker run --rm --network host \
+          docker run --rm --network bridge \
             -v "$PWD:/repo" \
             -v "$package:/tmp/firewall-web.apk:ro" \
             alpine:latest sh -ec '
@@ -144,7 +172,7 @@ jobs:
       - name: Install packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential debhelper lintian
+          sudo apt-get install -y --no-install-recommends build-essential debhelper lintian po-debconf
       - name: Build source and binary packages
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
@@ -158,7 +186,7 @@ jobs:
           docker run --rm -e PACKAGE_VERSION -e DEBIAN_FRONTEND=noninteractive \
             -v "$PWD:/repo" -w /repo debian:stable-slim sh -ec '
               apt-get update
-              apt-get install -y --no-install-recommends build-essential debhelper lintian
+              apt-get install -y --no-install-recommends build-essential debhelper lintian po-debconf
               packaging/build-source-deb.sh "$PACKAGE_VERSION"
               lintian --fail-on error dist/source/*.dsc dist/source/*.deb
             '

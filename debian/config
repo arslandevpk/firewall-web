@@ -1,0 +1,129 @@
+#!/bin/sh
+set -eu
+. /usr/share/debconf/confmodule
+
+config=/etc/firewall-web/firewall-web.env
+reconfigure=false
+if [ "${DPKG_RECONFIGURE:-}" = 1 ] || [ "${1:-}" = reconfigure ]; then
+    reconfigure=true
+fi
+
+current_value() {
+    key=$1
+    [ -r "$config" ] || return 0
+    perl -e '
+        $key = shift @ARGV;
+        $path = shift @ARGV;
+        open my $file, "<", $path or exit 0;
+        while (my $line = <$file>) {
+            if ($line =~ /^\s*\Q$key\E\s*=\s*(.*?)\s*$/) {
+                $value = $1;
+                if ($value =~ /^"(.*)"$/) { $value = $1; }
+                elsif ($value =~ /^'\''(.*)'\''$/) { $value = $1; }
+                $value =~ s/\\(["\\])/$1/g;
+                print $value;
+            }
+        }
+    ' "$key" "$config"
+}
+
+valid_value() {
+    field=$1
+    value=$2
+    case "$field" in
+        host)
+            perl -MSocket=AF_INET,AF_INET6,inet_pton -e '
+                $h = shift;
+                exit 0 if $h eq "localhost";
+                exit 0 if inet_pton(AF_INET, $h) || inet_pton(AF_INET6, $h);
+                exit 1 if $h =~ /\A[0-9.]+\z/;
+                exit 0 if $h =~ /\A(?=.{1,253}\z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\z/;
+                exit 1;
+            ' "$value"
+            ;;
+        port) perl -e '$v = shift; exit($v =~ /\A[0-9]{1,5}\z/ && $v >= 1 && $v <= 65535 ? 0 : 1)' "$value" ;;
+        secret) [ -z "$value" ] || perl -e 'exit(shift =~ /\A[0-9]{4}\z/ ? 0 : 1)' "$value" ;;
+        backend) case "$value" in auto|ufw|firewalld|nftables|iptables|inspection) return 0 ;; *) return 1 ;; esac ;;
+        *) return 1 ;;
+    esac
+}
+
+ask_setting() {
+    field=$1
+    template="firewall-web/$field"
+    while :; do
+        db_input high "$template" || true
+        db_go || true
+        db_get "$template"
+        answer=$RET
+        if valid_value "$field" "$answer"; then
+            return 0
+        fi
+        db_subst firewall-web/error field "$field"
+        db_input critical firewall-web/error || true
+        db_go || true
+        if [ "${DEBIAN_FRONTEND:-}" = noninteractive ]; then
+            echo "Invalid preseeded Firewall Web setting: $field" >&2
+            return 1
+        fi
+    done
+}
+
+installed=false
+if [ "$(dpkg-query -W -f='${db:Status-Status}' firewall-web 2>/dev/null || true)" = installed ]; then
+    installed=true
+fi
+
+if $reconfigure; then
+    for field in host port backend; do
+        value=$(current_value "NFT_$(printf '%s' "$field" | tr '[:lower:]' '[:upper:]')")
+        if valid_value "$field" "$value"; then
+            db_set "firewall-web/$field" "$value"
+        fi
+    done
+    ask_setting host
+    ask_setting port
+    ask_setting secret
+    ask_setting backend
+elif ! $installed; then
+    for field in host port secret backend; do
+        key="NFT_$(printf '%s' "$field" | tr '[:lower:]' '[:upper:]')"
+        value=$(current_value "$key")
+        if [ "$field" = secret ]; then
+            valid_existing=false
+            [ -n "$value" ] && valid_value "$field" "$value" && valid_existing=true
+        else
+            valid_existing=false
+            if valid_value "$field" "$value"; then
+                valid_existing=true
+                db_set "firewall-web/$field" "$value"
+            fi
+        fi
+        if [ "$valid_existing" != true ]; then
+            ask_setting "$field"
+        fi
+    done
+    db_input high firewall-web/start-service || true
+    db_go || true
+else
+    for field in host port secret backend; do
+        key="NFT_$(printf '%s' "$field" | tr '[:lower:]' '[:upper:]')"
+        value=$(current_value "$key")
+        if [ "$field" != secret ] && valid_value "$field" "$value"; then
+            db_set "firewall-web/$field" "$value"
+        fi
+        if [ "$field" = secret ]; then
+            valid_existing=false
+            [ -n "$value" ] && valid_value "$field" "$value" && valid_existing=true
+        else
+            valid_existing=false
+            valid_value "$field" "$value" && valid_existing=true
+        fi
+        if [ "$valid_existing" != true ]; then
+            ask_setting "$field"
+        fi
+    done
+fi
+
+db_stop
+exit 0

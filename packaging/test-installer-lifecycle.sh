@@ -26,10 +26,23 @@ docker run --rm --network bridge \
     test ! -e /etc/firewall-web
     test ! -e /opt/firewall-web
 
+    install_log=$(mktemp)
     PIP_NO_INDEX=1 PIP_FIND_LINKS=/tmp/firewall-web-wheels \
-      NFT_SECRET=0123 bash install.sh --backend inspection --non-interactive
+      bash install.sh --backend inspection --non-interactive >"$install_log" 2>&1
+    generated_pin=$(cat /var/lib/firewall-web/initial-pin)
+    case "$generated_pin" in
+      [0-9][0-9][0-9][0-9]) ;;
+      *) echo "Standalone onboarding did not create a four-digit PIN." >&2; exit 1 ;;
+    esac
+    test "$(stat -c %a /var/lib/firewall-web/initial-pin)" = 600
+    grep -qx "HAPPY FIREWALLING!" "$install_log"
+    if grep -Fq "$generated_pin" "$install_log"; then
+      echo "Generated PIN leaked into standalone installer output." >&2
+      exit 1
+    fi
+    rm -f "$install_log"
     test "$(stat -c %a /etc/firewall-web/firewall-web.env)" = 600
-    grep -qx "NFT_SECRET=0123" /etc/firewall-web/firewall-web.env
+    grep -qx "NFT_SECRET=$generated_pin" /etc/firewall-web/firewall-web.env
     grep -qx "NFT_BACKEND=inspection" /etc/firewall-web/firewall-web.env
     cp /etc/firewall-web/firewall-web.env /tmp/firewall-web.env.before-upgrade
 

@@ -1,3 +1,11 @@
+firewall-web (1.0.4-1) unstable; urgency=medium
+
+  * Add secure interactive and unattended installation onboarding.
+  * Validate service configuration and verify startup/readiness without firewall changes.
+  * Preserve administrator configuration and service state during upgrades.
+
+ -- arslandevpk <arslandevpk@users.noreply.github.com>  Fri, 30 Oct 2026 12:00:00 +0000
+
 firewall-web (1.0.3-1) unstable; urgency=medium
 
   * Add native UFW/firewalld management, drift detection, and bounded rollback.

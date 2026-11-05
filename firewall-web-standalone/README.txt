@@ -28,14 +28,36 @@ on an already managed host.
 FIRST INSTALL
 Unzip the archive and enter its firewall-web-standalone directory, then run:
   sudo bash install.sh
-Enter your OWN four-digit PIN. Leading zeros are supported. No PIN is shipped.
+The installer explains and validates the listen address, TCP port, firewall
+backend selection, and authentication PIN. The safe listen default is
+127.0.0.1:5005. Leave the PIN blank to generate a cryptographically random
+four-digit PIN; leading zeroes
+are preserved. The PIN is never printed. Retrieve a generated PIN with
+`sudo cat /var/lib/firewall-web/initial-pin` and securely remove that root-only
+file after recording it. Existing valid configuration and PINs are preserved.
 The installer creates a venv, installs application dependencies, runs
-read-only manager detection before configuring the service, writes a root-only
-environment file, and enables firewall-web.service, which runs the utility as
-root. No firewall rules or policies are changed at startup.
+read-only manager detection, writes a root-owned mode-0600 configuration file,
+and enables/starts the service by default on a running, unmasked systemd host.
+It verifies both service activity and authenticated application readiness.
+No firewall package is installed or activated, and no firewall rules,
+policies, ports, or persistence settings are changed.
+Use `--no-start-service` to defer service startup; the installer reports the
+actual service and boot-start states and the exact command to start it later.
+Configuration changes can be made with `sudoedit
+/etc/firewall-web/firewall-web.env`; restart with
+`sudo systemctl restart firewall-web.service`.
 Use `sudo bash install.sh --upgrade` for an idempotent application upgrade; it
 preserves the PIN, backend choice, service enablement, and local configuration.
-Pass `--backend` only to deliberately change the saved backend selection.
+Use `--backend` to explicitly set the saved backend selection during install.
+The installer also accepts `--listen-address IP_OR_HOST`, `--port PORT`,
+`--pin-file ROOT_ONLY_FILE`, `--start-service`, and `--no-start-service`.
+Noninteractive installation accepts safe defaults and generates a PIN when
+`NFT_SECRET` and `--pin-file` are omitted:
+  sudo bash install.sh --non-interactive --listen-address 127.0.0.1 --port 5005
+For unattended PIN provisioning, use a root-owned mode-0600 file containing
+one four-digit PIN and pass its path with `--pin-file`; do not put the PIN in
+command arguments or logs. `NFT_SECRET` is also accepted from the process
+environment. Remove a provisioning file securely when it is no longer needed.
 Use `sudo bash install.sh --uninstall` to remove the standalone app; its
 configuration, backups, and firewall rules are preserved. Uninstall refuses
 while nft-web-restore.service depends on the application code. Resolve or
@@ -46,11 +68,14 @@ DEBIAN PACKAGE ARTIFACTS
 Run the "Build Debian and Alpine packages" workflow from the GitHub Actions
 tab and enter a package version to build amd64 and arm64 .deb artifacts. The
 packages require system Python 3.10+, Flask 2.0+, and Waitress 2.0+. iptables
-and nftables are suggested for direct-management mode and are not installed
+and nftables are optional tools for direct-management mode and are not installed
 automatically, so package installation cannot start a second firewall or
 persistence service as a side effect.
 systemd is recommended for the optional service; it is not required to install
-or run the UI. CI installs each package in current Ubuntu and Debian userspaces
+or run the UI. No firewall manager is suggested or installed: Firewall Web
+uses the manager already present on the server and never activates firewalld
+or another competing manager during installation. CI installs packages in
+current Ubuntu and Debian userspaces
 with dependencies resolved from their unmodified default APT repositories.
 These artifacts are not yet published in the official distro repositories:
 `apt install firewall-web` requires Debian/Ubuntu archive acceptance and ongoing
@@ -60,13 +85,54 @@ Build it locally with `packaging/build-source-deb.sh [VERSION]` after installing
 `build-essential` and `debhelper`; outputs go to `dist/source/`.
 Install the matching artifact with:
   sudo apt install ./firewall-web_VERSION_ARCH.deb
-The package installs a disabled service and a root-only configuration file with
-no PIN configured; its systemd service runs the utility as root. Before starting
-the service, set your own four-digit PIN:
-  sudoedit /etc/firewall-web/firewall-web.env
-  sudo systemctl enable --now firewall-web.service
-Without systemd, configure the same file and run `firewall-web` in the
-foreground from the package's root shell.
+On a first install, Debian's debconf questions request the listen address, port,
+PIN, backend selection, and whether to start the service. Defaults are
+localhost-only and port 5005. Leave the PIN blank to generate a random PIN;
+the generated credential is kept root-only in
+`/var/lib/firewall-web/initial-pin`, not printed in logs. Retrieve it with
+`sudo cat /var/lib/firewall-web/initial-pin` and remove that file securely
+after recording it. The service runs as root. On a normal running systemd
+host, configuration is validated before the package enables/starts the
+service, then active state and authenticated HTTP readiness are verified.
+The package does not open ports or change firewall settings.
+
+The administrator-owned configuration is
+`/etc/firewall-web/firewall-web.env` (root-owned, mode 0600). Edit it with
+`sudoedit /etc/firewall-web/firewall-web.env`; apply changes with
+`sudo systemctl restart firewall-web.service`. Reconfigure interactively with
+`sudo dpkg-reconfigure firewall-web`; it reads current effective host/port/
+backend values, never displays the existing PIN, and a blank PIN answer
+generates a new one. Upgrades preserve the file, PIN, and deliberately stopped,
+disabled, or masked service state.
+
+For unattended installation, first create a root-only debconf preseed file;
+put the PIN in that file rather than in command arguments or logs:
+  sudo install -m 600 /dev/null /root/firewall-web.preseed
+  sudoedit /root/firewall-web.preseed
+Use entries such as; omit the password record to generate a PIN:
+  firewall-web firewall-web/host string 127.0.0.1
+  firewall-web firewall-web/port string 5005
+  firewall-web firewall-web/backend select auto
+  firewall-web firewall-web/start-service boolean true
+For an explicitly provisioned PIN, add a `password` record in this root-only
+file. Install with:
+  sudo debconf-set-selections /root/firewall-web.preseed
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install ./firewall-web_VERSION_ARCH.deb
+Remove the preseed file after installation. To explicitly provision a PIN,
+enter its four digits in the `password` preseed record, ensure the file is
+root-only, and securely remove it after installation. The debconf password
+answer is cleared after the configuration is persisted. On a host without
+running systemd, with a masked service, under `policy-rc.d`, or when startup
+is declined, installation reports the actual deferred state and next command.
+Without systemd, configure the same file and run `sudo firewall-web` in the
+foreground.
+
+Useful diagnostics:
+  sudo systemctl status firewall-web.service
+  sudo journalctl -u firewall-web.service -n 100 --no-pager
+  sudo firewall-web --detect
+If startup unexpectedly fails, correct the reported configuration problem
+before retrying with `sudo dpkg --configure -a`.
 Package builds can also be run locally with:
   packaging/build-deb.sh VERSION [amd64|arm64]
 Omit the architecture to use the host architecture. The resulting package is
@@ -141,9 +207,12 @@ the effect and retain console access before applying it. Direct nftables/
 iptables editors and persistence controls are disabled when UFW or firewalld
 owns the selected backend.
 
-Unattended standalone installation uses `--non-interactive` and requires
-`NFT_SECRET` in the environment. Backend selection can be supplied with
-`--backend`; ambiguous unattended auto-selection is saved as inspection-only.
+Unattended standalone installation uses `--non-interactive` and safe default
+host/port values; it generates a PIN if neither `NFT_SECRET` nor a root-only
+`--pin-file` is provided. Backend selection can be supplied with `--backend`;
+ambiguous unattended auto-selection is saved as inspection-only. Do not pass
+PINs in process arguments or CI output. Generated PINs are retrieved from
+`/var/lib/firewall-web/initial-pin`.
 `--dry-run` prints the read-only discovery report without changing packages,
 configuration, services, or firewall state (the selected Python interpreter
 must already be able to import Flask). Add `--json` for stable JSON output.

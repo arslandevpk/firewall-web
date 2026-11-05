@@ -15,7 +15,6 @@ depend() {
 start_pre() {
 	[ "$(id -u)" -eq 0 ] || eerror "firewall-web must run as root"
 	[ -r /etc/conf.d/firewall-web ] || eerror "Missing /etc/conf.d/firewall-web"
-	. /etc/conf.d/firewall-web
-	[ -n "$NFT_SECRET" ] || eerror "Set NFT_SECRET in /etc/conf.d/firewall-web"
-	export NFT_SECRET NFT_HOST NFT_PORT NFT_ALLOWED_ORIGINS NFT_BACKUP_DIR NFT_NATIVE_STATE NFT_BACKEND NFT_BACKEND_ACK
+	/usr/bin/python3 /usr/lib/firewall-web/firewall-web-config.py validate \
+		--config /etc/conf.d/firewall-web || eerror "Correct /etc/conf.d/firewall-web before starting."
 }

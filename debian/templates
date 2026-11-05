@@ -1,0 +1,57 @@
+Template: firewall-web/host
+Type: string
+_description: Listen address:
+ Choose an IP address assigned to this server. The safe default, 127.0.0.1,
+ allows access only from this machine; use an SSH tunnel for remote access.
+ The wildcard addresses 0.0.0.0 and :: listen on all interfaces and should
+ only be used when remote access is intentionally secured. You can change
+ this later in /etc/firewall-web/firewall-web.env; then run systemctl
+ restart firewall-web.service.
+Default: 127.0.0.1
+
+Template: firewall-web/port
+Type: string
+_description: TCP port:
+ Choose an unused TCP port from 1 to 65535. The default is 5005. You can
+ change this later in /etc/firewall-web/firewall-web.env; then run
+ systemctl restart firewall-web.service.
+Default: 5005
+
+Template: firewall-web/secret
+Type: password
+_description: Four-digit authentication PIN:
+ Enter exactly four digits. Leave this blank to generate a
+ cryptographically random four-digit PIN, including possible leading
+ zeroes. A generated PIN is saved root-only in
+ /var/lib/firewall-web/initial-pin; retrieve it with sudo cat
+ /var/lib/firewall-web/initial-pin, then securely remove that file. The PIN
+ is never shown in package logs. You can change it later in
+ /etc/firewall-web/firewall-web.env; then run systemctl restart
+ firewall-web.service.
+
+Template: firewall-web/backend
+Type: select
+_description: Firewall manager selection:
+ Choose auto to detect the existing manager conservatively. Inspection mode
+ is read-only. This setting does not install, activate, or modify any
+ firewall manager. You can change it later in
+ /etc/firewall-web/firewall-web.env; then run systemctl restart
+ firewall-web.service.
+__Choices: auto, ufw, firewalld, nftables, iptables, inspection
+Default: auto
+
+Template: firewall-web/start-service
+Type: boolean
+_Description: Start Firewall Web after installation?
+ Start and enable the Firewall Web web console after configuration is
+ validated. Starting the console does not activate a firewall manager,
+ change firewall rules, open ports, or change firewall policies. You can
+ change this choice later with systemctl enable/disable and systemctl
+ start/stop firewall-web.service.
+Default: true
+
+Template: firewall-web/error
+Type: error
+_description: Invalid Firewall Web setting
+ The value for ${field} is invalid. Correct it and try again. Settings are
+ stored in /etc/firewall-web/firewall-web.env.

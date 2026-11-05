@@ -16,6 +16,7 @@ mkdir -p "$source_dir" "$repo_root/dist/source"
 
 tar -C "$repo_root" \
   --exclude=.git --exclude=dist --exclude=debian --exclude=.venv \
+  --exclude=node_modules --exclude=test-results --exclude=playwright-report \
   --exclude=__pycache__ -cf - . | tar -C "$source_dir" -xf -
 cp -a "$repo_root/debian" "$source_dir/debian"
 sed -i "1s/^firewall-web ([^)]*) /firewall-web (${version}) /" "$source_dir/debian/changelog"

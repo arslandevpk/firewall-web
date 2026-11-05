@@ -16,14 +16,21 @@ override_dh_auto_install:
 	install -d -m 755 debian/firewall-web/usr/share/doc/firewall-web/font-licenses
 	install -m 644 firewall-web-standalone/fonts/licenses/* debian/firewall-web/usr/share/doc/firewall-web/font-licenses/
 	install -D -m 755 packaging/firewall-web debian/firewall-web/usr/bin/firewall-web
+	install -D -m 755 packaging/firewall-web-config.py debian/firewall-web/usr/lib/firewall-web/firewall-web-config.py
+	install -D -m 755 packaging/debian-postinst debian/firewall-web/usr/lib/firewall-web/debian-postinst
 	install -D -m 644 packaging/firewall-web.service debian/firewall-web/usr/lib/systemd/system/firewall-web.service
-	install -D -m 600 firewall-web-standalone/firewall-web.env.example debian/firewall-web/etc/firewall-web/firewall-web.env
+	install -D -m 600 packaging/firewall-web.env.debian debian/firewall-web/etc/firewall-web/firewall-web.env
 	install -D -m 644 firewall-web-standalone/README.txt debian/firewall-web/usr/share/doc/firewall-web/README
+	install -D -m 644 firewall-web-standalone/firewall-web.env.example debian/firewall-web/usr/share/doc/firewall-web/firewall-web.env.example
 	install -m 644 LICENSE debian/firewall-web/usr/share/doc/firewall-web/LICENSE
 	install -D -m 644 debian/firewall-web.8 debian/firewall-web/usr/share/man/man8/firewall-web.8
 
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start
+
+override_dh_installdebconf:
+	dh_installdebconf
+	sed -i -e 's/^description:/Description:/' -e 's/^choices:/Choices:/' -e 's/^default:/Default:/' debian/firewall-web/DEBIAN/templates
 
 override_dh_fixperms:
 	dh_fixperms

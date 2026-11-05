@@ -1,4 +1,4 @@
-.TH FIREWALL-WEB 8 "November 2026" "firewall-web 1.0.3" "System Administration"
+.TH FIREWALL-WEB 8 "November 2026" "firewall-web 1.0.4" "System Administration"
 .SH NAME
 firewall-web \- local web console for the Linux firewall
 .SH SYNOPSIS
@@ -41,16 +41,27 @@ The default listener is
 .BR 127.0.0.1:5005 .
 Use an SSH tunnel for remote access unless an authenticated HTTPS reverse proxy
 is configured.
+.PP
+On first Debian installation, debconf requests the listener, port, PIN, and
+backend. A blank PIN generates a random four-digit credential; retrieve it
+from the root-only
+.I /var/lib/firewall-web/initial-pin
+file and remove that file securely after recording it. Reconfigure with
+.BR "dpkg-reconfigure firewall-web" .
+Configuration changes require
+.BR "systemctl restart firewall-web.service" .
+Package installation does not open ports or change firewall rules. A normal
+systemd installation enables and starts the service only after configuration
+validation and verifies application readiness.
 .SH SECURITY
 Firewall modifications require the process to run as root with effective
 .BR CAP_NET_ADMIN .
 Without both, the interface is read-only and rejects all write requests.
 Termux PRoot cannot alter the Android host firewall.
 .PP
-Set a private four-digit
-.B NFT_SECRET
-in the configuration file before starting. Do not expose the PIN-only service
-to untrusted networks.
+The configuration is administrator-owned, root-only, and stored in
+.IR /etc/firewall-web/firewall-web.env .
+Do not expose the PIN-authenticated service to untrusted networks.
 .SH FILES
 .TP
 .I /etc/firewall-web/firewall-web.env
@@ -58,6 +69,10 @@ Root-only runtime configuration.
 .TP
 .I /usr/lib/firewall-web/firewall_web.py
 Application and bundled web assets.
+.TP
+.I /usr/lib/firewall-web/firewall-web-config.py
+Configuration validation and atomic update helper; the environment file is
+parsed as data and never sourced as shell code.
 .SH SEE ALSO
 .BR nft (8),
 .BR iptables (8)
