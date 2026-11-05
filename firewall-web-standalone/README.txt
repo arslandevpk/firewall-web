@@ -250,23 +250,48 @@ runtime/permanent separation, reload, external drift, rule rollback after the
 web process exits, rollback conflict preservation, unrelated rules, and a
 selective native nft restore that leaves an unrelated table intact.
 Docker does not boot a separate systemd VM, so these checks do not prove actual
-reboot survival or systemd timer behavior. Run the same script in a disposable
-privileged VM with systemd and reboot it to verify those lifecycle cases.
+service enablement or reboot survival. The following manual check must be run
+inside a disposable systemd VM with a console and snapshot, never on a
+development or production host. Use a separate VM snapshot for UFW and
+firewalld, install only the manager being tested, and take a snapshot before
+making changes.
+
+For UFW, add an unrelated sentinel before installing Firewall Web:
+
+    sudo ufw allow 42444/tcp comment 'firewall-web-test-sentinel'
+    sudo ufw --force enable
+
+For firewalld, add the sentinel permanently:
+
+    sudo firewall-cmd --permanent --zone=public --add-port=42444/tcp
+    sudo firewall-cmd --reload
+
+Copy the package for the VM architecture into the VM, install it with
+`sudo apt install ./firewall-web_1.0.4_ARCH.deb`, and answer the interactive
+setup prompts. With the default settings, verify initial startup and the
+unrelated rule:
+
+    sudo systemctl is-enabled firewall-web.service
+    sudo systemctl is-active firewall-web.service
+    curl --fail http://127.0.0.1:5005/ >/dev/null
+    sudo ufw status numbered
+
+For a firewalld VM, use `sudo firewall-cmd --state` and
+`sudo firewall-cmd --zone=public --query-port=42444/tcp` instead of the UFW
+status command. Use the Firewall Manager UI to make a test change, then run
+the manager's supported reload (`sudo ufw reload` or `sudo firewall-cmd
+--reload`) and verify both the test change and sentinel. Reboot the VM with
+`sudo systemctl reboot`. After it returns, repeat the service-active,
+service-enabled, HTTP-readiness, manager-status, and sentinel checks; for
+firewalld also verify the permanent sentinel with
+`sudo firewall-cmd --permanent --zone=public --query-port=42444/tcp`.
+Restore the VM snapshot when finished. Do not treat the Docker integration
+suite, a service restart, or a manager reload as evidence of reboot survival.
 Run `packaging/test-installer-lifecycle.sh` for an isolated standalone install,
 dry-run immutability, upgrade-preservation, and uninstall-guard check. Run
 `packaging/test-deb-lifecycle.sh` to verify Debian package upgrades, preserved
 configuration/data, and the native-restore uninstall guard. These scripts
 require Docker and network access to their package repositories.
-For reboot verification, use a disposable systemd VM with a console and a
-snapshot; never run firewall integration tests on a development or production
-host. Install one manager per test VM, install/enable the app only after
-reviewing detection, add a separate sentinel rule owned outside Firewall Web,
-then exercise native manager changes through the UI/API. Verify the manager's
-status and the sentinel rule, run its supported reload, reboot the VM, and
-repeat both checks. Test UFW and firewalld in separate VM snapshots. The Docker
-harness above verifies manager status, reload, rollback, and unrelated-rule
-preservation, but does not boot systemd, enable real boot-persistence services,
-or prove reboot survival.
 
 ACCESS
 For firewall changes, run the utility as root with CAP_NET_ADMIN. The UI can run
