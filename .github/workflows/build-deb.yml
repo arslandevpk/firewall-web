@@ -53,6 +53,10 @@ jobs:
         run: python3 packaging/test_firewall_web_config.py
       - name: Test standalone install, upgrade, dry-run, and uninstall
         run: packaging/test-installer-lifecycle.sh
+      - name: Install Debian package build dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends po-debconf
       - name: Test Debian debconf install, upgrade, remove, and purge
         run: packaging/test-deb-lifecycle.sh
 
