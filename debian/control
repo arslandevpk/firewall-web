@@ -15,7 +15,8 @@ Depends:
  ${misc:Depends},
  python3 (>= 3.10),
  python3-flask (>= 2.0),
- python3-waitress (>= 2.0)
+ python3-waitress (>= 2.0),
+ iproute2
 Recommends: systemd
 Description: local web console for the Linux firewall
  Inspect and manage UFW, firewalld, nftables, and IPv4/IPv6 iptables through

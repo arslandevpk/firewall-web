@@ -54,7 +54,7 @@ Version: $version
 Section: net
 Priority: optional
 Architecture: $architecture
-Depends: debconf (>= 0.5) | debconf-2.0, python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0)
+Depends: debconf (>= 0.5) | debconf-2.0, python3 (>= 3.10), python3-flask (>= 2.0), python3-waitress (>= 2.0), iproute2
 Recommends: systemd
 Maintainer: arslandevpk <arslandevpk@users.noreply.github.com>
 Homepage: https://github.com/arslandevpk/firewall-web
@@ -105,6 +105,9 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
 fi
 if [ "$1" = purge ]; then
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+        deb-systemd-helper purge firewall-web.service >/dev/null || true
+    fi
     db_purge
     rm -f /var/lib/firewall-web/initial-pin
     rmdir --ignore-fail-on-non-empty /var/lib/firewall-web 2>/dev/null || true

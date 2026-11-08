@@ -1,3 +1,15 @@
+firewall-web (1.0.5) unstable; urgency=medium
+
+  * Add read-only exact Port Checker as the first menu item, with rule locations and service usage.
+  * Remove custom appearance colors; add three readable light profiles.
+  * Prevent writes through unsupported managers and conflicting boot restorers.
+  * Correct UFW route/port syntax and preserve unrelated manager-owned rules.
+  * Start confirmation windows after response verification and retain durable rollback.
+  * Allow bounded slow systemd enable and daemon-reload operations.
+  * Preserve validated unattended installation, upgrades and removal behavior.
+
+ -- arslandevpk <arslandevpk@users.noreply.github.com>  Sat, 07 Nov 2026 10:55:00 +0000
+
 firewall-web (1.0.4-1) unstable; urgency=medium
 
   * Add secure interactive and unattended installation onboarding.

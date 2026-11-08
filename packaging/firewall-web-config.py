@@ -189,7 +189,7 @@ def check_readiness(path):
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     request = urllib.request.Request(
-        f"http://{host}:{values['NFT_PORT']}/api/status",
+        f"http://{host}:{values['NFT_PORT']}/api/health",
         headers={"X-Secret": values["NFT_SECRET"]},
     )
     try:

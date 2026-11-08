@@ -1,0 +1,59 @@
+name: Debian review artifacts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debian:
+    name: Verify and build ${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends po-debconf python3-flask python3-waitress
+      - name: Run regression tests
+        working-directory: firewall-web-standalone
+        run: python3 -m unittest test_port_checker test_firewall_detection test_health test_packaging test_ui_navigation
+      - name: Build and verify package
+        env:
+          PACKAGE_ARCH: ${{ matrix.architecture }}
+        run: |
+          set -eu
+          version=$(dpkg-parsechangelog -S Version)
+          packaging/build-deb.sh "$version" "$PACKAGE_ARCH"
+          package="dist/firewall-web_${version}_${PACKAGE_ARCH}.deb"
+          test "$(dpkg-deb -f "$package" Architecture)" = "$PACKAGE_ARCH"
+          test "$(dpkg-deb -f "$package" Version)" = "$version"
+          dpkg-deb -x "$package" /tmp/fwweb-payload
+          cmp firewall-web-standalone/firewall_web.py /tmp/fwweb-payload/usr/lib/firewall-web/firewall_web.py
+          python3 -m py_compile /tmp/fwweb-payload/usr/lib/firewall-web/firewall_web.py
+          git rev-parse HEAD > dist/SOURCE_COMMIT
+          sha256sum firewall-web-standalone/firewall_web.py > dist/SOURCE_SHA256
+          cd dist
+          sha256sum "firewall-web_${version}_${PACKAGE_ARCH}.deb" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firewall-web-debian-${{ matrix.architecture }}
+          path: |
+            dist/firewall-web_*.deb
+            dist/SHA256SUMS
+            dist/SOURCE_COMMIT
+            dist/SOURCE_SHA256
+          if-no-files-found: error
+          retention-days: 90

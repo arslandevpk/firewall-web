@@ -427,7 +427,9 @@ if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
   fi
   if [[ -z "$deferred_reason" ]]; then
     ready=false
-    for attempt in $(seq 1 30); do
+    readiness_deadline=$(($(date +%s) + 600))
+    for attempt in $(seq 1 600); do
+      (( $(date +%s) < readiness_deadline )) || break
       if systemctl is-active --quiet firewall-web.service &&
         /opt/firewall-web/venv/bin/python "$config_helper" ready --config "$config"; then
         ready=true

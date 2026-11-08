@@ -188,6 +188,31 @@ def _ufw_ipv6_setting():
     return None
 
 
+OTHER_FIREWALL_SERVICES = {
+    'ferm.service': 'ferm',
+    'shorewall.service': 'shorewall',
+    'shorewall6.service': 'shorewall6',
+    'firehol.service': 'firehol',
+    'arno-iptables-firewall.service': 'arno-iptables-firewall',
+    'csf.service': 'csf',
+    'apf.service': 'apf',
+}
+
+
+def other_firewall_managers():
+    # One read-only systemd query also discovers oneshot managers such as ferm.
+    result = _probe('systemctl', [
+        'list-units', '--type=service', '--state=active,activating,reloading',
+        '--no-legend', '--plain', '--no-pager', *OTHER_FIREWALL_SERVICES,
+    ])
+    if result.get('available'):
+        active = sorted({line.split()[0] for line in result.get('output', '').splitlines()
+                         if line.split() and line.split()[0] in OTHER_FIREWALL_SERVICES})
+        return {'active': active, 'unknown': []}
+    return {'active': [], 'unknown': sorted(
+        unit for unit, binary in OTHER_FIREWALL_SERVICES.items() if executable(binary))}
+
+
 def detect_firewall():
     """Read-only inventory and conservative selection of the controlling manager."""
     ufw = _probe('ufw', ['status', 'verbose'])
@@ -249,14 +274,24 @@ def detect_firewall():
             inventory_errors.append('firewalld zones could not be enumerated')
         zone_names = sorted(set(zones_result.get('output', '').split()) |
                             set(permanent_zones_result.get('output', '').split()))
+        zone_blocks = {}
+        for scope, args in (('runtime', ['--list-all-zones']),
+                            ('permanent', ['--permanent', '--list-all-zones'])):
+            result = _probe('firewall-cmd', args)
+            try:
+                zone_blocks[scope] = (_split_firewalld_zones(result['output'])
+                                      if result.get('available') else {})
+            except Problem:
+                zone_blocks[scope] = {}
+            if not result.get('available'):
+                inventory_errors.append(f'firewalld {scope} zones could not be read')
         for zone_name in zone_names:
-            runtime = _probe('firewall-cmd', [f'--zone={zone_name}', '--list-all'])
-            permanent = _probe('firewall-cmd', ['--permanent', f'--zone={zone_name}', '--list-all'])
-            if not runtime.get('available') or not permanent.get('available'):
+            runtime = zone_blocks['runtime'].get(zone_name)
+            permanent = zone_blocks['permanent'].get(zone_name)
+            if runtime is None or permanent is None:
                 inventory_errors.append(f'firewalld zone {zone_name} could not be read')
             firewalld_inventory['zones'][zone_name] = {
-                'runtime': runtime.get('output') if runtime.get('available') else None,
-                'permanent': permanent.get('output') if permanent.get('available') else None,
+                'runtime': runtime, 'permanent': permanent,
             }
         runtime_policies = _probe('firewall-cmd', ['--get-policies'])
         permanent_policies = _probe('firewall-cmd', ['--permanent', '--get-policies'])
@@ -401,7 +436,16 @@ def detect_firewall():
         except OSError:
             forwarded[family] = None
 
+    other_managers = other_firewall_managers()
+    other_ownership = other_managers['active'] or other_managers['unknown']
     active_managers = [name for name, active in (('ufw', ufw_active), ('firewalld', firewalld_active)) if active]
+    persistence_conflicts = [
+        service for key, service in (
+            ('nftables', 'nftables.service'),
+            ('netfilter_persistent', 'netfilter-persistent.service'),
+            ('native_restore', 'nft-web-restore.service'))
+        if active_managers and (persistence[key].get('enabled') or persistence[key].get('active'))
+    ]
     required_conflict_ack = (
         'active-managers:' + ','.join(sorted(active_managers))
         if len(active_managers) > 1 else None)
@@ -418,7 +462,15 @@ def detect_firewall():
         direct.append('nftables')
     if default_populated or legacy_populated or nft_compat_populated:
         direct.append('iptables')
-    if len(active_managers) > 1:
+    if other_ownership:
+        selected = 'inspection'
+        reason = ('Unsupported firewall manager ownership is active or cannot be established: '
+                  + ', '.join(other_ownership) + '; writes are disabled. Use the owning manager.')
+    elif persistence_conflicts:
+        selected = 'inspection'
+        reason = ('An active firewall manager conflicts with direct boot restore services: '
+                  + ', '.join(persistence_conflicts) + '; writes are disabled until ownership is resolved.')
+    elif len(active_managers) > 1:
         reason = 'Multiple firewall managers report active; writes are disabled until an administrator resolves ownership.'
         selected = 'inspection'
     elif uncertain:
@@ -447,7 +499,9 @@ def detect_firewall():
         reason = f'Invalid NFT_BACKEND={requested!r}; inspection-only mode is active.'
         selected = 'inspection'
     elif requested != 'auto':
-        if requested == selected:
+        if (other_ownership or persistence_conflicts) and requested != 'inspection':
+            pass  # Explicit backend selection cannot bypass another firewall manager.
+        elif requested == selected:
             pass
         elif requested == 'inspection':
             selected = 'inspection'
@@ -499,6 +553,8 @@ def detect_firewall():
         'ownership_concerns': {'ufw_chains': ufw_owned_chains,
                                'firewalld_tables': firewalld_tables if firewalld_active is not True else []},
         'active_managers': active_managers,
+        'other_firewall_managers': other_managers,
+        'persistence_conflicts': persistence_conflicts,
         'conflict_acknowledgement': required_conflict_ack,
         'selected_backend': selected,
         'write_backends': write_backends if selected == 'iptables' else [],
@@ -545,6 +601,7 @@ def detect_firewall():
             'iptables': iptables_configuration,
             'persistence': persistence,
         }
+    selected_configuration['other_firewall_managers'] = other_managers
     selected_configuration['observed_ownership'] = {
         'ufw': {
             'status': ufw_info['status'],
@@ -629,7 +686,8 @@ def run(name, args=(), stdin=None):
     try:
         p = subprocess.run(
             [binary, *args], input=stdin, capture_output=True, text=True,
-            timeout=12, env={'PATH': PATH, 'LC_ALL': 'C'}, check=False,
+            timeout=(180 if name == 'systemctl' and args and args[0] in ('enable', 'daemon-reload') else 12),
+            env={'PATH': PATH, 'LC_ALL': 'C'}, check=False,
         )
     except subprocess.TimeoutExpired:
         raise Problem(f'{name} timed out. Refresh before retrying: a change may have completed.', 504)
@@ -791,6 +849,437 @@ def capture():
         states = dict(pool.map(one, names))
     return {'created_utc': datetime.now(timezone.utc).isoformat(), 'states': states,
             'note': 'iptables-nft and nftables overlap; default commands may alias explicit backends. Snapshot only; configure boot restoration in Persistence.'}
+
+
+# Read-only, exact-port inspection. A verdict describes NEW incoming traffic at
+# the local firewall, not an Internet reachability test or a firewall change.
+def _pc_port_contains(value, port):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) or isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value) == port
+    if isinstance(value, dict):
+        if 'elem' in value and isinstance(value['elem'],dict):
+            return _pc_port_contains(value['elem'].get('val'),port)
+        if 'range' in value:
+            try:
+                return int(value['range'][0]) <= port <= int(value['range'][1])
+            except (ValueError, TypeError, IndexError):
+                return None
+        if 'set' in value:
+            return _pc_port_contains(value['set'], port)
+        return None
+    if isinstance(value, list):
+        matches = [_pc_port_contains(v, port) for v in value]
+        return True if True in matches else None if None in matches else False
+    if isinstance(value, str) and re.fullmatch(r'[0-9,:-]+', value):
+        members = []
+        for part in value.split(','):
+            limits = re.split('[:-]', part)
+            members.append({'range': limits} if len(limits) == 2 else part)
+        return _pc_port_contains(members, port)
+    return None
+
+
+def _pc_ipt_condition(rule, protocol, family, port):
+    spec = rule['spec']; conditions = []; explicit = False; target = 'next'; jump = None
+    i = 0; negate = False
+    while i < len(spec):
+        arg = spec[i]; i += 1
+        if arg == '!':
+            negate = True; continue
+        if arg in ('-j', '--jump', '-g', '--goto'):
+            if i == len(spec): return None, False, 'unknown', None
+            target = spec[i]; i += 1
+            if arg in ('-g', '--goto'):
+                jump = target; target = 'goto'
+            continue
+        if arg in ('--comment', '--log-prefix', '--log-level', '--reject-with'):
+            i += 1; continue
+        value = None
+        if arg in ('-p', '--protocol', '--dport', '--destination-port', '--dports',
+                   '--destination-ports', '--sport', '--source-port', '--sports',
+                   '-s', '--source', '-d', '--destination', '-i', '--in-interface',
+                   '-o', '--out-interface', '--ctstate', '--state', '--dst-type', '--src-type', '--rt-type', '-m', '--match'):
+            if i == len(spec): return None, False, 'unknown', None
+            value = spec[i]; i += 1
+        if value == '!' and i < len(spec):
+            negate = True; value = spec[i]; i += 1
+        condition = True
+        if arg in ('-p', '--protocol'):
+            condition = value in ('all', '0', protocol, '6' if protocol == 'tcp' else '17')
+        elif arg in ('--dport', '--destination-port', '--dports', '--destination-ports'):
+            condition = _pc_port_contains(value, port)
+            if condition is True and not negate: explicit = True
+        elif arg in ('--ctstate', '--state'):
+            condition = 'NEW' in value.upper().split(',')
+        elif arg in ('-s', '--source', '-d', '--destination'):
+            condition = True if value in ('0.0.0.0/0', '::/0', 'anywhere') else None
+        elif arg in ('-i', '--in-interface'):
+            condition = False if value == 'lo' else None
+        elif arg in ('-o', '--out-interface'):
+            condition = None
+        elif arg in ('--sport', '--source-port', '--sports'):
+            condition = None
+        elif arg == '--dst-type':
+            condition = True if value == 'LOCAL' else False if value in ('MULTICAST','BROADCAST') else None
+        elif arg == '--src-type':
+            condition = False if value == 'LOCAL' else None
+        elif arg == '--rt-type':
+            condition = False if value == '0' else None
+        elif arg in ('-m', '--match'):
+            condition = True if value in ('tcp', 'udp', 'multiport', 'conntrack', 'state', 'comment','addrtype') else None
+        elif arg == '--syn':
+            condition = protocol == 'tcp'
+        elif arg == '--tcp-flags':
+            # Only the common NEW TCP SYN test is unambiguous here.
+            pair = spec[i:i+2]; i += 2
+            condition = True if protocol == 'tcp' and pair == ['FIN,SYN,RST,ACK', 'SYN'] else None
+        elif value is None:
+            condition = None
+        if negate:
+            condition = None if condition is None else not condition
+            negate = False
+        conditions.append(condition)
+    if target in ('ACCEPT',): action = 'allow'
+    elif target in ('DROP', 'REJECT'): action = 'block'
+    elif target == 'RETURN': action = 'return'
+    elif target in ('LOG', 'NFLOG', 'MARK', 'CONNMARK', 'CT', 'NOTRACK', 'next'): action = 'next'
+    elif target in ('DNAT', 'REDIRECT'): action = 'forward'
+    elif target == 'goto': action = 'goto'
+    elif target == 'unknown': action = 'unknown'
+    else: action, jump = 'jump', target
+    condition = False if False in conditions else None if None in conditions else True
+    return condition, explicit, action, jump
+
+
+def _pc_protocol_contains(value, protocol):
+    if isinstance(value,dict) and 'set' in value: value=value['set']
+    if isinstance(value,list):
+        results=[_pc_protocol_contains(v,protocol) for v in value]
+        return True if True in results else None if None in results else False
+    if value in (protocol,6 if protocol=='tcp' else 17):return True
+    if isinstance(value,int):return False
+    if value in ('tcp','udp','icmp','icmpv6','ipv6-icmp','igmp','sctp','dccp','udplite','esp','ah','gre'):return False
+    return None
+
+
+def _pc_nft_condition(rule, protocol, family, port, sets):
+    conditions = []; explicit = False; action = 'next'; jump = None
+    for expr in rule.get('expr', []):
+        if not isinstance(expr, dict):
+            conditions.append(None); continue
+        if any(k in expr for k in ('counter', 'log', 'comment')): continue
+        if 'accept' in expr: action = 'allow'; continue
+        if 'drop' in expr or 'reject' in expr: action = 'block'; continue
+        if 'return' in expr: action = 'return'; continue
+        if 'jump' in expr:
+            action, jump = 'jump', expr['jump'].get('target'); continue
+        if 'goto' in expr:
+            action, jump = 'goto', expr['goto'].get('target'); continue
+        if 'vmap' in expr:
+            vmap = expr['vmap']; key = vmap.get('key', {})
+            entries = vmap.get('data', {}).get('set') if isinstance(vmap.get('data'),dict) else None
+            if isinstance(key,dict) and key.get('ct',{}).get('key')=='state' and isinstance(entries,list):
+                valid=True; selected=None
+                for entry in entries:
+                    if isinstance(entry,list) and len(entry)==2: value, verdict=entry
+                    elif isinstance(entry,dict) and isinstance(entry.get('elem'),dict): value, verdict=entry['elem'].get('val'),entry['elem'].get('data')
+                    else: valid=False;break
+                    if value=='new':selected=verdict
+                if valid and selected is None:continue
+                if valid and isinstance(selected,dict):
+                    if 'accept' in selected:action='allow';continue
+                    if 'drop' in selected or 'reject' in selected:action='block';continue
+            action='unknown';continue
+        if 'dnat' in expr or 'redirect' in expr: action = 'forward'; continue
+        m = expr.get('match')
+        if not isinstance(m, dict):
+            conditions.append(None); continue
+        left, right, op = m.get('left'), m.get('right'), m.get('op', '==')
+        condition = None
+        if isinstance(left, dict) and 'payload' in left:
+            payload = left['payload']; field = payload.get('field'); transport = payload.get('protocol')
+            if transport in ('ip','ip6') and transport != family:
+                condition = False
+            elif transport in ('icmp','icmpv6','icmpx'):
+                condition = False
+            elif field in ('dport', 'sport'):
+                if transport in ('tcp', 'udp') and transport != protocol:
+                    condition = False
+                elif field == 'dport':
+                    if isinstance(right, str) and right.startswith('@'):
+                        right = sets.get((rule.get('family'), rule.get('table'), right[1:]))
+                    condition = _pc_port_contains(right, port)
+                    if condition is True and op in ('==', 'in'): explicit = True
+            elif field in ('saddr', 'daddr'):
+                if isinstance(right, dict) and right.get('prefix', {}).get('len') == 0: condition = True
+            elif field in ('protocol', 'nexthdr'):
+                condition = _pc_protocol_contains(right,protocol)
+        elif isinstance(left, dict) and 'meta' in left:
+            key = left['meta'].get('key')
+            if key == 'l4proto':
+                if isinstance(right,str) and right.startswith('@'):right=sets.get((rule.get('family'),rule.get('table'),right[1:]))
+                condition = _pc_protocol_contains(right,protocol)
+            elif key == 'nfproto':
+                condition = right in (family,'ipv4' if family=='ip' else 'ipv6',2 if family=='ip' else 10) if right in ('ip','ip6','ipv4','ipv6',2,10) else None
+            elif key in ('iifname', 'iif') and right in ('lo', 1): condition = False
+        elif isinstance(left, dict) and 'ct' in left and left['ct'].get('key') == 'state':
+            values = right.get('set', []) if isinstance(right, dict) else [right]
+            condition = 'new' in values
+        if op in ('!=', 'not in'): condition = None if condition is None else not condition
+        elif op not in ('==', 'in'): condition = None
+        conditions.append(condition)
+    return (False if False in conditions else None if None in conditions else True), explicit, action, jump
+
+
+def _pc_layer_verdict(layer, protocol, family, port):
+    """Conservative symbolic walk: unknown address/interface matches branch.
+
+    Rule order, jumps/returns, default policies and multiple base chains matter.
+    Never turn a partially understood path into an unconditional 'allowed'.
+    """
+    rules = layer['rules']; chains = layer['chains']; sets = layer.get('sets', {})
+    memo = {}; budget = [10000]
+    def walk(chain, trail=()):
+        if chain in memo: return memo[chain]
+        if chain in trail or len(trail) > 24 or chain not in chains: return {'unknown'}
+        pending = True; results = set()
+        for rule in rules.get(chain, []):
+            budget[0] -= 1
+            if budget[0] < 0: return {'unknown'}
+            if layer['kind'] == 'iptables': cond, _, action, target = _pc_ipt_condition(rule, protocol, family, port)
+            else: cond, _, action, target = _pc_nft_condition(rule, protocol, family, port, sets)
+            if cond is False: continue
+            if action == 'next': continue
+            if action == 'return':
+                results.add('return')
+                if cond is True: pending = False; break
+                continue
+            outcomes = walk(target, trail+(chain,)) if action in ('jump','goto') else {action}
+            if action == 'goto':
+                results.update(outcomes)
+                if cond is True: pending = False; break
+                continue
+            results.update(outcomes - {'return'})
+            if cond is True and 'return' not in outcomes:
+                pending = False; break
+        if pending:
+            policy = chains[chain].get('policy', 'return').lower()
+            results.add({'accept':'allow', 'drop':'block'}.get(policy, 'return'))
+        memo[chain] = results
+        return results
+    verdicts = []
+    for root in layer['roots']:
+        outcomes = walk(root)
+        if 'return' in outcomes:
+            outcomes = (outcomes-{'return'}) | {{'accept':'allow','drop':'block'}.get(chains[root].get('policy','accept').lower(),'unknown')}
+        if outcomes == {'block'}: verdicts.append('blocked')
+        elif outcomes == {'allow'} or outcomes == {'return'}: verdicts.append('allowed')
+        elif 'unknown' in outcomes or 'forward' in outcomes: verdicts.append('unknown')
+        else: verdicts.append('restricted')
+    return 'blocked' if 'blocked' in verdicts else 'unknown' if 'unknown' in verdicts else 'restricted' if 'restricted' in verdicts else 'allowed'
+
+
+def _pc_layers(nft_payload, saves):
+    layers = []; skipped = set()
+    for backend, state in saves.items():
+        family = 'ip6' if backend.startswith('ip6') else 'ip'
+        if backend.endswith('-nft'): skipped.update((family,table) for table in state['tables'])
+        for table in state['tables']:
+            chains = {c['name']:c for c in state['chains'] if c['table'] == table}
+            rules = {name:[r for r in state['rules'] if r['table'] == table and r['chain'] == name] for name in chains}
+            roots = [name for name in ('PREROUTING', 'INPUT') if name in chains and chains[name]['policy'] != '-']
+            if table == 'nat': roots = []  # Translation is shown separately, not called an input allow.
+            layers.append({'kind':'iptables','backend':backend,'family':family,'table':table,'chains':chains,'rules':rules,'roots':roots})
+    sets = {}
+    for item in nft_payload.get('nftables', []):
+        value = item.get('set') or item.get('element')
+        if isinstance(value, dict):
+            key = (value.get('family'), value.get('table'), value.get('name'))
+            sets.setdefault(key, []).extend(value.get('elem', []))
+    tables = {}
+    for item in nft_payload.get('nftables', []):
+        for kind in ('chain', 'rule'):
+            r = item.get(kind)
+            if not isinstance(r, dict): continue
+            family, table = r.get('family'), r.get('table')
+            if (family,table) in skipped: continue
+            if family not in ('ip', 'ip6', 'inet', 'bridge', 'netdev'): continue
+            key = (family, table)
+            layer = tables.setdefault(key, {'kind':'nftables','backend':'nftables','family':family,'table':table,'chains':{},'rules':{},'roots':[],'sets':sets})
+            if kind == 'chain':
+                layer['chains'][r['name']] = r
+                if r.get('hook') in ('input', 'prerouting', 'ingress'): layer['roots'].append(r['name'])
+            else: layer['rules'].setdefault(r['chain'], []).append(r)
+    layers.extend(tables.values())
+    return layers
+
+
+def _pc_advanced_effect(layer, protocol, family, port):
+    # A translation, NOTRACK or userspace verdict can change the tuple/state
+    # before later rules. Do not evaluate those later rules against old values.
+    roots=[n for n,c in layer['chains'].items() if
+           (layer['kind']=='iptables' and n in ('PREROUTING','INPUT') and c.get('policy')!='-')
+           or (layer['kind']=='nftables' and c.get('hook') in ('prerouting','input','ingress'))]
+    pending=list(roots);seen=set()
+    while pending:
+        chain=pending.pop()
+        if chain in seen:continue
+        seen.add(chain)
+        if len(seen)>10000:return True
+        for rule in layer['rules'].get(chain,[]):
+            cond,_,action,target=(_pc_ipt_condition(rule,protocol,family,port) if layer['kind']=='iptables' else _pc_nft_condition(rule,protocol,family,port,layer.get('sets',{})))
+            if cond is False:continue
+            if action in ('jump','goto'):
+                if target not in layer['chains']:return True
+                pending.append(target)
+            if action in ('unknown','forward'):return True
+            if layer['kind']=='iptables':
+                if 'NOTRACK' in rule['spec'] or '--notrack' in rule['spec']:return True
+            else:
+                understood={'match','counter','log','comment','accept','drop','reject','return','jump','goto','limit','quota','vmap'}
+                if any(not isinstance(expr,dict) or set(expr)-understood for expr in rule.get('expr',[])):return True
+    return False
+
+
+def _pc_rule_rows(layers, port):
+    rows = []
+    for layer in layers:
+        parents = {}
+        for chain, rules in layer['rules'].items():
+            for r in rules:
+                if layer['kind'] == 'iptables': target = _pc_ipt_condition(r, 'tcp', layer['family'], port)[3]
+                else: target = next((x[k].get('target') for x in r.get('expr', []) if isinstance(x,dict) for k in ('jump','goto') if k in x), None)
+                if target: parents.setdefault(target, set()).add(chain)
+        scope_cache={}
+        def scope(name, trail=()):
+            if name in scope_cache: return scope_cache[name]
+            if name in trail or len(trail)>24: return 'Other rule'
+            c = layer['chains'].get(name, {}); hook = c.get('hook')
+            if name == 'INPUT' and layer['kind'] == 'iptables' or hook == 'input': return 'Incoming'
+            if name == 'FORWARD' or hook == 'forward': return 'Forwarded'
+            if name == 'OUTPUT' or hook == 'output': return 'Outgoing'
+            if name == 'PREROUTING' or hook in ('prerouting', 'ingress'): return 'Before incoming traffic'
+            scopes = {scope(p, trail+(name,)) for p in parents.get(name, [])}
+            result='Incoming' if 'Incoming' in scopes else next(iter(sorted(scopes)), 'Unused chain')
+            scope_cache[name]=result
+            return result
+        for chain, rules in layer['rules'].items():
+            for index, rule in enumerate(rules, 1):
+                for protocol in ('tcp', 'udp'):
+                    families = ['ip','ip6'] if layer['family'] in ('inet','bridge','netdev') else [layer['family']]
+                    applicable = []
+                    for family in families:
+                        cond, explicit, action, _ = (_pc_ipt_condition(rule, protocol, family, port) if layer['kind']=='iptables' else _pc_nft_condition(rule, protocol, family, port, layer.get('sets', {})))
+                        if cond is not False and (explicit or action in ('allow','block','forward')): applicable.append((family, cond, action, explicit))
+                    if not applicable: continue
+                    action = applicable[0][2]
+                    location = ('Rule #'+str(rule['number'])) if layer['kind']=='iptables' else ('Handle #'+str(rule['handle']) if 'handle' in rule else 'Rule '+str(index)+' (display order)')
+                    expression = rule.get('expression') if layer['kind']=='iptables' else json.dumps(rule.get('expr', []), sort_keys=True)
+                    rows.append({'protocol':protocol,'family':'IPv4 + IPv6' if len(applicable)==2 else 'IPv6' if applicable[0][0]=='ip6' else 'IPv4',
+                                 'action':{'allow':'Allow','block':'Block','forward':'Forward','jump':'Continue checking'}.get(action,'Check needed'),
+                                 'scope':scope(chain),'location':location,'backend':layer['backend'],'table':layer['table'],'chain':chain,
+                                 'port_specific':any(e for _,_,_,e in applicable),'restricted':any(c is None for _,c,_,_ in applicable),'rule':expression,
+                                 'identity':json.dumps([layer['backend'],layer['family'],layer['table'],chain,protocol,rule.get('spec',stable(rule.get('expr',[])))],sort_keys=True)})
+    counts = {}
+    for row in rows: counts[row['identity']] = counts.get(row['identity'],0)+1
+    for row in rows: row['copies'] = counts[row.pop('identity')]
+    return rows
+
+
+def _pc_listener_rows(tcp, udp, port):
+    rows = []
+    for raw in (tcp, udp):
+        for line in raw.splitlines():
+            parts = line.split(None, 6)
+            if len(parts) < 6: continue
+            protocol = 'tcp' if parts[0].startswith('tcp') else 'udp' if parts[0].startswith('udp') else None
+            if not protocol or protocol == 'tcp' and parts[1] != 'LISTEN': continue
+            address, sep, number = parts[4].rpartition(':')
+            if not sep or not number.isdigit() or int(number) != port: continue
+            processes = re.findall(r'\("([^"\n]+)",pid=([0-9]+)', parts[6] if len(parts)>6 else '')
+            services = []
+            for name, pid in processes:
+                unit = None
+                try:
+                    groups = Path('/proc')/pid/'cgroup'
+                    units=[v for v in groups.read_text(errors='replace').replace('\n','/').split('/') if v.endswith('.service')]
+                    unit=units[-1] if units else None
+                except (OSError, StopIteration): pass
+                services.append({'name':name,'pid':int(pid),'unit':unit})
+            row = {'protocol':protocol,'address':address.strip('[]'),'services':services,
+                   'local_only':address.strip('[]') in ('127.0.0.1','::1')}
+            if row not in rows: rows.append(row)
+    return rows
+
+
+def inspect_port(port):
+    notes = []; saves = {}; probes = {}
+    names = [n for n in ('nft','iptables-nft-save','ip6tables-nft-save','iptables-legacy-save','ip6tables-legacy-save','iptables-save','ip6tables-save') if executable(n)]
+    def read(name):
+        return name, _probe(name, ['-j','-a','-n','list','ruleset'] if name=='nft' else ['-c'])
+    with ThreadPoolExecutor(max_workers=4) as pool: probes = dict(pool.map(read,names))
+    nft_payload = {}; readable = False
+    if probes.get('nft',{}).get('available'):
+        try:
+            nft_payload=json.loads(probes['nft']['output'])
+            if not isinstance(nft_payload,dict) or not isinstance(nft_payload.get('nftables'),list): raise ValueError('Incomplete rules')
+            readable=True
+        except (ValueError, KeyError): notes.append('Some firewall rules could not be read.')
+    elif 'nft' in probes: notes.append('Native firewall rules could not be read.')
+    for family in ('iptables','ip6tables'):
+        explicit = [n for n in (family+'-nft-save',family+'-legacy-save') if n in probes]
+        for name in explicit or [family+'-save']:
+            result=probes.get(name,{})
+            if result.get('available'):
+                try:
+                    saves[name.removesuffix('-save')]=parse_save(result['output'],name.removesuffix('-save'));readable=True
+                except (ValueError,KeyError): notes.append('Some firewall rules could not be parsed.')
+            elif name in probes: notes.append('Some '+('IPv6' if family.startswith('ip6') else 'IPv4')+' firewall rules could not be read.')
+    layers=_pc_layers(nft_payload,saves);rows=_pc_rule_rows(layers,port)
+    results={}
+    for protocol in ('tcp','udp'):
+        families={}
+        for family in ('ip','ip6'):
+            applicable=[l for l in layers if l['roots'] and l['family'] in (family,'inet','bridge','netdev')]
+            verdicts=[_pc_layer_verdict(l,protocol,family,port) for l in applicable]
+            verdicts=['unknown' if l['family'] in ('bridge','netdev') and v!='allowed' else v for l,v in zip(applicable,verdicts)]
+            advanced=any(_pc_advanced_effect(l,protocol,family,port) for l in layers if l['family'] in (family,'inet','bridge','netdev'))
+            forwarded=any(r['protocol']==protocol and r['action']=='Forward' and r['scope']=='Before incoming traffic' and r['family'] in (('IPv4','IPv4 + IPv6') if family=='ip' else ('IPv6','IPv4 + IPv6')) for r in rows)
+            value='unknown' if forwarded or advanced else 'blocked' if 'blocked' in verdicts else 'unknown' if 'unknown' in verdicts or notes or not readable else 'restricted' if 'restricted' in verdicts else 'allowed'
+            families['IPv6' if family=='ip6' else 'IPv4']=value
+        values=set(families.values())
+        value=next(iter(values)) if len(values)==1 else 'restricted'
+        results[protocol]={'state':value,'families':families,'label':{'allowed':'Allowed','blocked':'Not opened','restricted':'Restricted / mixed rules','unknown':'Could not fully check'}[value]}
+    if not notes and any('unknown' in v['families'].values() for v in results.values()):
+        notes.append('An advanced or forwarding rule needs a closer check; no open/closed guess was made.')
+    tcp=_probe('ss',['-H','-antup'])
+    listeners=_pc_listener_rows(tcp.get('output',''),'',port)
+    usage_known=tcp.get('available')
+    if not usage_known:notes.append('Listening services could not be fully checked. Root access and ss are needed.')
+    managers=[]
+    ufw=_probe('ufw',['status']);firewalld=_probe('firewall-cmd',['--state'])
+    if re.search(r'(?im)^Status:\s*active\s*$',ufw.get('output','')):managers.append('UFW')
+    if firewalld.get('output','').strip()=='running':managers.append('firewalld')
+    if len(managers)>1: notes.append('More than one firewall manager is active; review the matching rules.')
+    allowed=[p.upper() for p,v in results.items() if v['state']=='allowed']
+    if len(allowed)==2:summary='TCP and UDP allowed'
+    elif all(v['state']=='blocked' for v in results.values()):summary='Not opened'
+    elif allowed: summary=allowed[0]+' allowed; '+('UDP' if allowed[0]=='TCP' else 'TCP')+' '+results['udp' if allowed[0]=='TCP' else 'tcp']['label'].lower()
+    else:summary='Restricted or mixed access' if any(v['state']=='restricted' for v in results.values()) else 'Could not fully check'
+    return {'port':port,'summary':summary,'protocols':results,'rules':rows,'listeners':listeners,'usage_known':bool(usage_known),
+            'firewall':', '.join(managers) or 'Live kernel firewall','notes':list(dict.fromkeys(notes)),
+            'scope':'New incoming traffic at this server. Local firewall rules only; cloud/router rules and external reachability are not tested.',
+            'checked_utc':datetime.now(timezone.utc).isoformat()}
+
+
+@app.get('/api/port-check')
+def port_check():
+    value=request.args.get('port','').strip()
+    if not re.fullmatch(r'[0-9]{1,5}',value) or not 1<=int(value)<=65535:
+        raise Problem('Enter one port number from 1 to 65535.')
+    return jsonify(inspect_port(int(value)))
 
 
 def backup(required=None):
@@ -1099,6 +1588,11 @@ def headers(response):
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Referrer-Policy'] = 'no-referrer'
     response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    if response.status_code < 300 and request.method in ('POST', 'DELETE'):
+        payload = response.get_json(silent=True)
+        if isinstance(payload, dict) and payload.get('pending_rollback_id'):
+            # Inventory verification may be slow; the browser gets the full window.
+            arm_rollback_confirmation(payload['pending_rollback_id'])
     return response
 
 
@@ -1130,6 +1624,12 @@ def font_asset(filename):
     if not mimetype:
         raise Problem('Font not found.', 404)
     return send_from_directory(FONT_DIR, filename, mimetype=mimetype, max_age=31536000)
+
+
+@app.get('/api/health')
+def health():
+    # Readiness must not launch a full firewall inventory on every retry.
+    return jsonify(ok=True)
 
 
 @app.get('/api/status')
@@ -1255,13 +1755,13 @@ def _ufw_rule_insert_args(number, rule_text, has_ipv4_ipv6_pair=False):
         args += ['in', 'on', in_iface]
     if out_iface:
         args += ['out', 'on', out_iface]
-    if source_address != 'any':
+    if source_address != 'any' or source_port:
         args += ['from', source_address]
     elif destination == 'any' and not has_ipv4_ipv6_pair:
         args += ['from', '::/0' if family_hint == 'ip6' else '0.0.0.0/0']
     if source_port:
         args += ['port', source_port]
-    if destination != 'any':
+    if destination != 'any' or destination_port:
         args += ['to', destination]
     if destination_port:
         args += ['port', destination_port]
@@ -1345,7 +1845,7 @@ def ufw_add_rule():
             args += ['port', source_port]
     elif source_port:
         args += ['from', 'any', 'port', source_port]
-    if destination != 'any':
+    if destination != 'any' or port:
         args += ['to', destination]
     if port:
         args += ['port', port]
@@ -1521,6 +2021,22 @@ def _firewalld_policies(permanent=False):
     return out.split()
 
 
+def _split_firewalld_zones(output):
+    zones, current = {}, None
+    for line in output.splitlines():
+        if line and not line[:1].isspace():
+            match = re.fullmatch(r'([A-Za-z0-9_.-]+)(?:\s+\([^\r\n]*\))?\s*', line)
+            if not match or match.group(1) in zones:
+                raise Problem('Could not parse firewalld zone inventory safely.', 503)
+            current = match.group(1)
+            zones[current] = [line]
+        elif current is not None:
+            zones[current].append(line)
+        elif line.strip():
+            raise Problem('Could not parse firewalld zone inventory safely.', 503)
+    return {name: '\n'.join(lines).rstrip() for name, lines in zones.items()}
+
+
 def _parse_firewalld_list_all(output):
     values = {}
     for line in output.splitlines():
@@ -1558,9 +2074,14 @@ def _firewalld_zone(zone, permanent=False):
 
 def _firewalld_state():
     runtime_zones, permanent_zones = _firewalld_zones(), _firewalld_zones(True)
+    runtime = _split_firewalld_zones(checked('firewall-cmd', ['--list-all-zones']))
+    permanent = _split_firewalld_zones(checked('firewall-cmd', ['--permanent', '--list-all-zones']))
+    if (set(runtime) != set(runtime_zones) or set(permanent) != set(permanent_zones)
+            or set(runtime) != set(permanent)):
+        raise Problem('Firewalld zone inventory changed or was incomplete; refresh before writing.', 409)
     zones = {
-        zone: {'runtime': _firewalld_zone(zone),
-               'permanent': _firewalld_zone(zone, True)}
+        zone: {'runtime': _parse_firewalld_list_all(runtime[zone]),
+               'permanent': _parse_firewalld_list_all(permanent[zone])}
         for zone in sorted(set(runtime_zones) | set(permanent_zones))
     }
     runtime_policies, permanent_policies = _firewalld_policies(), _firewalld_policies(True)
@@ -1607,7 +2128,7 @@ def prepare_rollback(manager, inverse_args, before):
         'manager': manager,
         'inverse_args': inverse_args,
         'before': before, 'expected_after': None,
-        'created_at': time.time(), 'deadline': time.time() + ROLLBACK_SECONDS,
+        'created_at': time.time(), 'deadline': time.time() + max(600, ROLLBACK_SECONDS),
         'status': 'pending', 'message': 'Waiting for administrator confirmation.',
     }
     _write_rollback(record)
@@ -1619,7 +2140,7 @@ def prepare_rollback(manager, inverse_args, before):
                 env_args.append('--setenv=NFT_BACKEND=' + backend_setting)
             checked('systemd-run', [
                 '--quiet', '--collect', '--unit=firewall-web-rollback-' + rollback_id,
-                f'--on-active={ROLLBACK_SECONDS}s', *env_args, '--',
+                '--on-active=1s', *env_args, '--',
                 sys.executable, str(Path(__file__).resolve()), '--rollback', rollback_id,
             ])
         else:
@@ -1662,6 +2183,18 @@ def commit_rollback(rollback_id, expected_after):
         _write_rollback(record)
 
 
+def arm_rollback_confirmation(rollback_id):
+    with rollback_lock(rollback_id):
+        path = _rollback_path(rollback_id)
+        record = json.loads(path.read_text())
+        if record.get('status') != 'pending' or record.get('expected_after') is None:
+            raise Problem('The change could not be armed for confirmation; refresh the firewall state.', 409)
+        record['ready_at'] = time.time()
+        record['deadline'] = record['ready_at'] + ROLLBACK_SECONDS
+        record['message'] = 'Confirm this change before the rollback deadline.'
+        _write_rollback(record)
+
+
 def cancel_rollback(rollback_id):
     with rollback_lock(rollback_id):
         path = _rollback_path(rollback_id)
@@ -1690,39 +2223,41 @@ def confirm_rollback(rollback_id):
 
 def run_rollback(rollback_id):
     path = _rollback_path(rollback_id)
-    try:
-        record = json.loads(path.read_text())
-    except OSError:
-        return
-    delay = max(0, record.get('deadline', 0) - time.time())
-    if delay:
-        time.sleep(delay)
-    with rollback_lock(rollback_id):
-        try:
-            record = json.loads(path.read_text())
+    while path.exists():
+        with rollback_lock(rollback_id):
+            try:
+                record = json.loads(path.read_text())
+            except OSError:
+                return
             if record.get('status') != 'pending':
                 return
-            if record.get('expected_after') is None:
-                record['status'] = 'conflict'
-                record['message'] = 'The operation did not record its resulting state; no rollback was attempted.'
-            else:
-                current = manager_state(record['manager'])
-                detection = detect_firewall()
-                if (not can_manage_firewall() or detection['selected_backend'] != record['manager']
-                        or current != record['expected_after']):
+            remaining = record.get('deadline', 0) - time.time()
+            if remaining <= 0:
+                try:
+                    if record.get('expected_after') is None:
+                        record['status'] = 'conflict'
+                        record['message'] = 'The operation did not record its resulting state; no rollback was attempted.'
+                    else:
+                        current = manager_state(record['manager'])
+                        detection = detect_firewall()
+                        if (not can_manage_firewall() or detection['selected_backend'] != record['manager']
+                                or current != record['expected_after']):
+                            record['status'] = 'conflict'
+                            record['message'] = ('Firewall manager state changed after the operation; rollback was skipped '
+                                                 'to preserve concurrent changes. Review the current rules manually.')
+                        else:
+                            command = 'ufw' if record['manager'] == 'ufw' else 'firewall-cmd'
+                            checked(command, record['inverse_args'])
+                            record['status'] = 'rolled_back'
+                            record['message'] = 'The unconfirmed change was selectively rolled back.'
+                except (Problem, OSError, ValueError, KeyError) as exc:
                     record['status'] = 'conflict'
-                    record['message'] = ('Firewall manager state changed after the operation; rollback was skipped '
-                                         'to preserve concurrent changes. Review the current rules manually.')
-                else:
-                    command = 'ufw' if record['manager'] == 'ufw' else 'firewall-cmd'
-                    checked(command, record['inverse_args'])
-                    record['status'] = 'rolled_back'
-                    record['message'] = 'The unconfirmed change was selectively rolled back.'
-        except (Problem, OSError, ValueError, KeyError) as exc:
-            record['status'] = 'conflict'
-            record['message'] = 'Rollback failed safely: ' + (
-                exc.message if isinstance(exc, Problem) else str(exc))
-        _write_rollback(record)
+                    record['message'] = 'Rollback failed safely: ' + (
+                        exc.message if isinstance(exc, Problem) else str(exc))
+                _write_rollback(record)
+                return
+        # Re-read deadlines and confirmations; never sleep while holding the record lock.
+        time.sleep(min(remaining, 1.0))
 
 
 @app.get('/api/rollback/<rollback_id>')
@@ -2256,6 +2791,12 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:650px;overflow:auto;f
 :root{--text:#d7dfe8;--control-bg:#0d1117;--button-bg:#21262d;--sidebar-bg:#111720;--sidebar-text:#a6b1c0;--heading-text:#edf3fb;--nav-active-bg:#152a40;--nav-active-text:#b8dcff}
 :root[data-theme=light]{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#cbd2d9;--muted:#586575;--blue:#0969da;--green:#1a7f37;--red:#cf222e;--text:#1f2328;--control-bg:#fff;--button-bg:#f3f4f6;--sidebar-bg:#e9edf2;--sidebar-text:#3e4c5c;--heading-text:#1f2328;--nav-active-bg:#dbeafe;--nav-active-text:#084298}
 body{color:var(--text);font-size:var(--ui-font-size,14px)}
+pre{background:var(--control-bg);color:var(--text)}
+.tab .nav-index{color:var(--muted)}
+:root[data-theme=light] .tab.active .nav-index{color:var(--nav-active-text)}
+:root[data-theme=light] .sidebar-footer strong{color:#166534}
+:root[data-theme=light] #toast{background:#e8f5ec}
+:root[data-theme=light] #toast.error{background:#fff0ee}
 button,input,select,textarea{background:var(--control-bg);color:var(--text)}
 button{background:var(--button-bg)}
 .sidebar{background:var(--sidebar-bg)}
@@ -2281,8 +2822,12 @@ body,button,input,select,textarea{font-family:var(--ui-font-family,ui-monospace,
 .site-credit{text-align:center;margin:48px 0 2px;padding:10px;font-size:9px;color:var(--muted)}
 .site-credit a{color:inherit;text-decoration:underline;text-underline-offset:2px}
 .setting-control input[type=range]{width:min(420px,100%);accent-color:var(--blue)}
-.color-control{display:flex;align-items:center;gap:12px}
-.color-control input[type=color]{width:56px;min-width:56px;max-width:56px;height:42px;padding:3px;cursor:pointer}
+#app[data-active-tab=ports] .toolbar :is(#badges,#manager-summary,#refresh,label),#app[data-active-tab=ports] #access-warning{display:none}
+#app[data-active-tab=ports] .toolbar{justify-content:flex-end}
+.port-check-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:16px}
+.port-check-grid .card{margin:0}#port-check-results{overflow-wrap:anywhere}.port-check-verdict{font-size:20px;font-weight:700;margin:8px 0}
+.port-check-rule{padding:12px 0;border-bottom:1px solid var(--line)}.port-check-rule:last-child{border:0}
+.port-check-rule summary{padding:4px 0}.port-check-rule p{overflow-wrap:anywhere}.port-check-rule .badge{margin-left:0}
 .presets{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-top:12px}
 .preset{padding:10px;background:var(--control-bg);color:var(--text);border:1px solid var(--line);border-radius:8px;text-align:left}
 .preset-swatch{display:grid;place-items:center;height:62px;margin-bottom:8px;border:1px solid color-mix(in srgb,var(--text) 20%,transparent);border-radius:5px;font-size:30px;font-weight:700}
@@ -2297,17 +2842,18 @@ body,button,input,select,textarea{font-family:var(--ui-font-family,ui-monospace,
 <div class="sidebar-heading">FIREWALL CONSOLE</div>
 <nav class="tabs" role="tablist" aria-label="Firewall sections" aria-orientation="vertical">
 <p class="nav-group" role="presentation">Rules &amp; networking</p>
-<button id="tab-overview" role="tab" aria-selected="true" aria-controls="overview" tabindex="0" class="tab active" data-tab="overview"><span class="nav-index" aria-hidden="true">01</span>All Rules</button>
-<button id="tab-manager" role="tab" aria-selected="false" aria-controls="manager" tabindex="-1" class="tab" data-tab="manager"><span class="nav-index" aria-hidden="true">02</span>Firewall Manager</button>
-<button id="tab-nft" role="tab" aria-selected="false" aria-controls="nft" tabindex="-1" class="tab" data-tab="nft"><span class="nav-index" aria-hidden="true">03</span>nftables</button>
-<button id="tab-ipt" role="tab" aria-selected="false" aria-controls="ipt" tabindex="-1" class="tab" data-tab="ipt"><span class="nav-index" aria-hidden="true">04</span>iptables</button>
-<button id="tab-masq" role="tab" aria-selected="false" aria-controls="masq" tabindex="-1" class="tab" data-tab="masq"><span class="nav-index" aria-hidden="true">05</span>Masquerade</button>
+<button id="tab-ports" role="tab" aria-selected="false" aria-controls="ports" tabindex="-1" class="tab" data-tab="ports"><span class="nav-index" aria-hidden="true">01</span>Port Checker</button>
+<button id="tab-overview" role="tab" aria-selected="true" aria-controls="overview" tabindex="0" class="tab active" data-tab="overview"><span class="nav-index" aria-hidden="true">02</span>All Rules</button>
+<button id="tab-manager" role="tab" aria-selected="false" aria-controls="manager" tabindex="-1" class="tab" data-tab="manager"><span class="nav-index" aria-hidden="true">03</span>Firewall Manager</button>
+<button id="tab-nft" role="tab" aria-selected="false" aria-controls="nft" tabindex="-1" class="tab" data-tab="nft"><span class="nav-index" aria-hidden="true">04</span>nftables</button>
+<button id="tab-ipt" role="tab" aria-selected="false" aria-controls="ipt" tabindex="-1" class="tab" data-tab="ipt"><span class="nav-index" aria-hidden="true">05</span>iptables</button>
+<button id="tab-masq" role="tab" aria-selected="false" aria-controls="masq" tabindex="-1" class="tab" data-tab="masq"><span class="nav-index" aria-hidden="true">06</span>Masquerade</button>
 <p class="nav-group" role="presentation">Administration</p>
-<button id="tab-persistence" role="tab" aria-selected="false" aria-controls="persistence" tabindex="-1" class="tab" data-tab="persistence"><span class="nav-index" aria-hidden="true">06</span>Persistence</button>
-<button id="tab-backups" role="tab" aria-selected="false" aria-controls="backups" tabindex="-1" class="tab" data-tab="backups"><span class="nav-index" aria-hidden="true">07</span>Backups</button>
-<button id="tab-advanced" role="tab" aria-selected="false" aria-controls="advanced" tabindex="-1" class="tab" data-tab="advanced"><span class="nav-index" aria-hidden="true">08</span>Advanced</button>
+<button id="tab-persistence" role="tab" aria-selected="false" aria-controls="persistence" tabindex="-1" class="tab" data-tab="persistence"><span class="nav-index" aria-hidden="true">07</span>Persistence</button>
+<button id="tab-backups" role="tab" aria-selected="false" aria-controls="backups" tabindex="-1" class="tab" data-tab="backups"><span class="nav-index" aria-hidden="true">08</span>Backups</button>
+<button id="tab-advanced" role="tab" aria-selected="false" aria-controls="advanced" tabindex="-1" class="tab" data-tab="advanced"><span class="nav-index" aria-hidden="true">09</span>Advanced</button>
 <p class="nav-group" role="presentation">Personalization</p>
-<button id="tab-display" role="tab" aria-selected="false" aria-controls="display" tabindex="-1" class="tab" data-tab="display"><span class="nav-index" aria-hidden="true">09</span>Display and Feel</button>
+<button id="tab-display" role="tab" aria-selected="false" aria-controls="display" tabindex="-1" class="tab" data-tab="display"><span class="nav-index" aria-hidden="true">10</span>Display and Feel</button>
 </nav>
 <div class="sidebar-footer"><strong>Live firewall</strong>Save edits in Persistence to restore them after boot.</div>
 <button id="sidebar-close" class="sidebar-close">Close menu</button>
@@ -2316,6 +2862,11 @@ body,button,input,select,textarea{font-family:var(--ui-font-family,ui-monospace,
 <div id="workspace" class="workspace">
 <header class="page-heading"><button id="menu-toggle" class="menu-toggle" aria-controls="sidebar" aria-expanded="false" aria-label="Open sections">Sections</button><div><h2 id="page-title">All Rules</h2><p id="page-description" class="muted">A complete view of the firewall backends installed on this machine.</p></div></header>
 <div class="row between toolbar"><div id="badges"></div><div class="row toolbar-actions"><span id="manager-summary" class="badge" role="status" aria-live="polite">Firewall manager: checking</span><button id="refresh" class="primary">Refresh</button><label>Auto-refresh<select id="auto"><option value="0">Off</option><option value="15">15 seconds</option><option value="30">30 seconds</option></select></label><button id="logout">Lock</button></div></div><p id="access-warning" class="muted notice warning hidden" role="status"></p>
+<section id="ports" class="panel hidden" role="tabpanel" aria-labelledby="tab-ports" tabindex="0">
+<div class="card"><h2>Check a port</h2><p class="muted">See what the firewall allows and which service is using the port. Nothing is changed.</p>
+<form id="port-check-form" class="row"><label>Port number<input id="port-check-number" name="port" type="number" min="1" max="65535" step="1" inputmode="numeric" placeholder="80" required></label><button id="port-check-submit" class="primary">Check port</button></form></div>
+<div id="port-check-results" role="status" aria-live="polite"><p class="muted">Enter a port number above, for example 80.</p></div>
+</section>
 <section id="manager" class="panel hidden" role="tabpanel" aria-labelledby="tab-manager" tabindex="0"><section class="card" aria-labelledby="detection-heading"><div class="row between"><div><h2 id="detection-heading">Firewall manager detection</h2><p id="detection-summary" class="muted" role="status" aria-live="polite">Detection has not run yet.</p></div><div class="row"><button id="refresh-detection" type="button">Refresh detection</button><button id="review-detection" type="button" class="hidden">Review detected changes</button></div></div><pre id="detection-details"></pre>
 <div id="ufw-controls" class="hidden"><h3>UFW-managed rules</h3><p class="muted">Changes use UFW and are persisted by UFW. IPv4/IPv6 behavior follows UFW configuration. Risky rule changes start a 90-second rollback unless you confirm keeping them.</p>
 <form id="ufw-add" class="manager-write-form"><div class="row"><label>Rule kind<select name="kind"><option value="port">Host rule</option><option value="route">Forwarded route</option></select></label><label>Action<select name="action"><option>allow</option><option>deny</option><option>reject</option><option>limit</option></select></label><label>Direction<select name="direction"><option value="">Any</option><option>in</option><option>out</option></select></label><label>Source network<input name="source" value="any" placeholder="any or 192.0.2.0/24"></label><label>Source port/range<input name="source_port" placeholder="optional"></label><label>Destination network<input name="destination" value="any" placeholder="any or 198.51.100.0/24"></label><label>Destination port/range<input name="port" placeholder="22 or 8000:8010"></label><label>Protocol<select name="protocol"><option>tcp</option><option>udp</option></select></label><label>Incoming interface<input name="interface_in" placeholder="optional interface"></label><label>Outgoing interface<input name="interface_out" placeholder="optional interface"></label><label>Comment<input name="comment" maxlength="120"></label><button class="good">Add UFW rule</button></div></form>
@@ -2353,9 +2904,7 @@ body,button,input,select,textarea{font-family:var(--ui-font-family,ui-monospace,
 <div class="setting-control"><label class="animation-setting"><input id="header-animation" type="checkbox" checked>Animate header</label></div>
 <div class="setting-control"><label for="font-size">Font size: <output id="font-size-value">14px</output></label><input id="font-size" type="range" min="12" max="20" step="1" value="14"></div>
 <div class="setting-control"><label for="font-family">Bundled font family</label><select id="font-family"><option value="JetBrains Mono,ui-monospace,monospace">JetBrains Mono</option><option value="Hack,ui-monospace,monospace">Hack</option><option value="Fira Code,ui-monospace,monospace">Fira Code</option><option value="Source Code Pro,ui-monospace,monospace">Source Code Pro</option><option value="Cascadia Code,ui-monospace,monospace">Cascadia Code</option><option value="IBM Plex Mono,ui-monospace,monospace">IBM Plex Mono</option><option value="Inconsolata,ui-monospace,monospace">Inconsolata</option></select></div>
-<div class="setting-control"><label for="background-color">Background color</label><div class="color-control"><input id="background-color" type="color" value="#0d1117"><span class="muted">Choose a custom page background.</span></div></div>
-<div class="setting-control"><label for="font-color">Font color</label><div class="color-control"><input id="font-color" type="color" value="#d7dfe8"><span class="muted">Choose the primary text color.</span></div></div>
-<div class="setting-control"><h3>Quick looks</h3><p class="muted">Choose from six curated palettes, three light and three dark.</p><div id="appearance-presets" class="presets"></div></div>
+<div class="setting-control"><h3>Quick looks</h3><p class="muted">Choose from nine curated palettes, six light and three dark.</p><div id="appearance-presets" class="presets"></div></div>
 </div></section>
 <p id="updated" class="muted"></p></div></div></section><div id="toast" class="hidden" role="status"></div>
 <footer class="site-credit"><em>Created &amp; Conceptualized by <a href="https://github.com/arslandevpk/firewall-web" target="_blank" rel="noopener noreferrer">arslandevpk</a></em></footer>
@@ -2369,13 +2918,51 @@ const colorPresets=[
 {name:'Paper',theme:'light',bg:'#f4f6f8',text:'#1f2328'},
 {name:'Warm Sand',theme:'light',bg:'#f5efe6',text:'#332719'},
 {name:'Soft Mint',theme:'light',bg:'#eaf4ef',text:'#18352a'},
+{name:'Soft Sky',theme:'light',bg:'#edf5ff',text:'#20334d'},
+{name:'Light Lavender',theme:'light',bg:'#f3effb',text:'#352b49'},
+{name:'Pale Rose',theme:'light',bg:'#fff1f3',text:'#482b35'},
 {name:'Midnight',theme:'dark',bg:'#0d1117',text:'#d7dfe8'},
 {name:'Deep Ocean',theme:'dark',bg:'#0a1929',text:'#d5e8ff'},
 {name:'Forest',theme:'dark',bg:'#102019',text:'#d7eee0'}];
-let appearance={theme:'system',font:fontFamilies[0],size:14,bg:'',text:'',animate:!matchMedia('(prefers-reduced-motion: reduce)').matches};
-try{const saved=JSON.parse(localStorage.getItem(appearanceKey)||'{}');if(['system','light','dark'].includes(saved.theme))appearance.theme=saved.theme;if(fontFamilies.includes(saved.font))appearance.font=saved.font;if(Number.isInteger(saved.size)&&saved.size>=12&&saved.size<=20)appearance.size=saved.size;if(typeof saved.bg==='string'&&/^#[0-9a-f]{6}$/i.test(saved.bg))appearance.bg=saved.bg;if(typeof saved.text==='string'&&/^#[0-9a-f]{6}$/i.test(saved.text))appearance.text=saved.text;if(typeof saved.animate==='boolean')appearance.animate=saved.animate}catch(error){console.warn('Could not load saved appearance settings:',error)}
-function applyAppearance(save=true){const root=document.documentElement;const effective=appearance.theme==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):appearance.theme;root.dataset.theme=effective;root.style.setProperty('--ui-font-family',appearance.font);root.style.setProperty('--ui-font-size',appearance.size+'px');if(appearance.bg)root.style.setProperty('--bg',appearance.bg);else root.style.removeProperty('--bg');if(appearance.text)root.style.setProperty('--text',appearance.text);else root.style.removeProperty('--text');$('theme-select').value=appearance.theme;$('font-family').value=appearance.font;$('font-size').value=appearance.size;$('font-size-value').textContent=appearance.size+'px';$('background-color').value=appearance.bg|| (effective==='dark'?'#0d1117':'#f4f6f8');$('font-color').value=appearance.text|| (effective==='dark'?'#d7dfe8':'#1f2328');$('header-animation').checked=appearance.animate;for(const button of document.querySelectorAll('.preset'))button.setAttribute('aria-pressed',String(colorPresets.some(p=>p.name===button.dataset.preset&&p.theme===appearance.theme&&p.bg===appearance.bg&&p.text===appearance.text)));if(save){try{localStorage.setItem(appearanceKey,JSON.stringify(appearance))}catch(error){notice('Appearance updated but could not be saved in this browser: '+error.message,true)}}}
-function initAppearance(){const holder=$('appearance-presets');for(const preset of colorPresets){const button=el('button',undefined,'preset');button.type='button';button.dataset.preset=preset.name;button.setAttribute('aria-pressed','false');const swatch=el('span','A','preset-swatch');swatch.style.background=preset.bg;swatch.style.color=preset.text;button.append(swatch,el('span',preset.name+' · '+preset.theme));button.onclick=()=>{appearance.theme=preset.theme;appearance.bg=preset.bg;appearance.text=preset.text;applyAppearance()};holder.append(button)}$('theme-select').onchange=()=>{appearance.theme=$('theme-select').value;applyAppearance()};$('font-family').onchange=()=>{appearance.font=$('font-family').value;applyAppearance()};$('font-size').oninput=()=>{appearance.size=Number($('font-size').value);applyAppearance()};$('background-color').oninput=()=>{appearance.bg=$('background-color').value;applyAppearance()};$('font-color').oninput=()=>{appearance.text=$('font-color').value;applyAppearance()};$('header-animation').onchange=()=>{appearance.animate=$('header-animation').checked;applyAppearance();setHeaderAnimation(appearance.animate)};matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(appearance.theme==='system')applyAppearance(false)});applyAppearance(false);setHeaderAnimation(appearance.animate)}
+let appearance={theme:'system',font:fontFamilies[0],size:14,preset:'',animate:!matchMedia('(prefers-reduced-motion: reduce)').matches};
+try{
+ const saved=JSON.parse(localStorage.getItem(appearanceKey)||'{}');
+ if(['system','light','dark'].includes(saved.theme))appearance.theme=saved.theme;
+ if(fontFamilies.includes(saved.font))appearance.font=saved.font;
+ if(Number.isInteger(saved.size)&&saved.size>=12&&saved.size<=20)appearance.size=saved.size;
+ // Preserve curated legacy selections, but discard arbitrary custom colors.
+ const preset=colorPresets.find(p=>p.theme===appearance.theme&&(p.name===saved.preset||(!saved.preset&&p.bg===saved.bg&&p.text===saved.text)));
+ if(preset)appearance.preset=preset.name;
+ if(typeof saved.animate==='boolean')appearance.animate=saved.animate;
+}catch(error){console.warn('Could not load saved appearance settings:',error)}
+function applyAppearance(save=true){
+ const root=document.documentElement;
+ const effective=appearance.theme==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):appearance.theme;
+ const preset=colorPresets.find(p=>p.name===appearance.preset&&p.theme===effective);
+ root.dataset.theme=effective;
+ root.style.setProperty('--ui-font-family',appearance.font);root.style.setProperty('--ui-font-size',appearance.size+'px');
+ for(const [variable,value] of [['--bg',preset?.bg],['--text',preset?.text]]){
+  if(value)root.style.setProperty(variable,value);else root.style.removeProperty(variable);
+ }
+ $('theme-select').value=appearance.theme;$('font-family').value=appearance.font;$('font-size').value=appearance.size;$('font-size-value').textContent=appearance.size+'px';$('header-animation').checked=appearance.animate;
+ for(const button of document.querySelectorAll('.preset'))button.setAttribute('aria-pressed',String(button.dataset.preset===preset?.name));
+ if(save){try{localStorage.setItem(appearanceKey,JSON.stringify(appearance))}catch(error){notice('Appearance updated but could not be saved in this browser: '+error.message,true)}}
+}
+function initAppearance(){
+ const holder=$('appearance-presets');
+ for(const preset of colorPresets){
+  const button=el('button',undefined,'preset');button.type='button';button.dataset.preset=preset.name;button.setAttribute('aria-pressed','false');
+  const swatch=el('span','A','preset-swatch');swatch.style.background=preset.bg;swatch.style.color=preset.text;
+  button.append(swatch,el('span',preset.name+' · '+preset.theme));
+  button.onclick=()=>{appearance.theme=preset.theme;appearance.preset=preset.name;applyAppearance()};holder.append(button);
+ }
+ $('theme-select').onchange=()=>{appearance.theme=$('theme-select').value;appearance.preset='';applyAppearance()};
+ $('font-family').onchange=()=>{appearance.font=$('font-family').value;applyAppearance()};
+ $('font-size').oninput=()=>{appearance.size=Number($('font-size').value);applyAppearance()};
+ $('header-animation').onchange=()=>{appearance.animate=$('header-animation').checked;applyAppearance();setHeaderAnimation(appearance.animate)};
+ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(appearance.theme==='system')applyAppearance(false)});
+ applyAppearance(false);setHeaderAnimation(appearance.animate);
+}
 let headerTimer=null;
 function setHeaderAnimation(enabled){clearTimeout(headerTimer);const text=$('brand-text'),full='firewall_web';let index=enabled?0:full.length,deleting=false;text.textContent=full.slice(0,index);if(!enabled)return;function type(){index++;text.textContent=full.slice(0,index);if(index===full.length){deleting=true;headerTimer=setTimeout(erase,1000)}else headerTimer=setTimeout(type,130)}function erase(){index--;text.textContent=full.slice(0,index);if(index===0){deleting=false;headerTimer=setTimeout(type,350)}else headerTimer=setTimeout(erase,95)}headerTimer=setTimeout(type,350)}
 function notice(message,error=false){const t=$('toast');t.textContent=message;t.className=error?'error':'';clearTimeout(t._timer);t._timer=setTimeout(()=>t.classList.add('hidden'),error?12000:5005)}
@@ -2393,14 +2980,63 @@ function configureBackends(){if(!status.detection)return;const d=status.detectio
 async function refresh(force=false){if(refreshing||(busy&&!force)||!key)return;refreshing=true;try{const previous=status.detection?.selected_backend,detection=await api('/api/detection');renderDetection(detection);if(previous&&previous!==detection.selected_backend)notice('Firewall manager changed from '+previous+' to '+detection.selected_backend+'. Writes were re-evaluated; review detection before continuing.',true);await refreshManager();configureBackends();snapshot=await api('/api/overview');nft=snapshot.states.nft;ipt=snapshot.states[$('i-backend').value];overviewView();renderRules(nft,true);renderRules(ipt,false);$('updated').textContent='Last refreshed '+new Date().toLocaleString()+' | Rule counters are snapshots.'}finally{refreshing=false}}
 function updateManagerToken(token){if(status.managerStateToken&&status.managerStateToken!==token){status.pendingManagerStateToken=token;status.managerDrift=true;status.read_only_reason='Manager configuration changed externally. Review the current rules before enabling controls.'}else if(!status.managerDrift)status.managerStateToken=token;setFirewallWritable(status.can_manage_firewall,status.read_only_reason)}
 async function refreshManager(){if(!key)return;const selected=status.detection?.selected_backend;if(selected==='ufw'){const d=await api('/api/ufw');updateManagerToken(d.state_token);$('ufw-status').textContent=d.status+'\nIPv6: '+(d.ipv6||'unknown');const host=$('ufw-rules');host.replaceChildren();for(const rule of d.rules){const row=el('div',`[${rule.number}] ${rule.text}`,'row between');const button=el('button','Delete','danger');button.disabled=!status.can_manage_firewall||status.managerDrift||status.detection.selection_review_required;button.onclick=()=>{if(confirm('Delete this UFW rule after revalidating its displayed number and text? This action may affect IPv4/IPv6 rules separately. Keep console access.\\n'+rule.text))change('/api/ufw/rule','DELETE',{number:rule.number,token:rule.token,state_token:status.managerStateToken})};row.append(button);host.append(row)}}else if(selected==='firewalld'){const d=await api('/api/firewalld');updateManagerToken(d.state_token);options($('firewalld-zone'),Object.keys(d.zones).map(zone=>[zone,zone]));options($('firewalld-policy'),Object.keys(d.policies).map(policy=>[policy,policy]));const caps=d.capabilities||{};for(const [value,cap] of [['source','source_bindings'],['interface','zone_bindings'],['rich-rule','rich_rules']])$('firewalld-add').elements.namedItem('type').querySelector('option[value="'+value+'"]').disabled=!caps[cap];$('firewalld-scope').querySelector('option[value="policy"]').disabled=!caps.policies;$('firewalld-policy').disabled=!caps.policies||$('firewalld-scope').value!=='policy';$('firewalld-zone').disabled=$('firewalld-scope').value==='policy';$('firewalld-status').textContent='Version: '+(d.version||'unknown')+'\\nDefault zone: '+(d.default_zone||'unknown')+'\\nPermanent default zone: '+(d.permanent_default_zone||'unknown')+'\\nActive zone bindings: '+JSON.stringify(d.active_zones)+'\\nRuntime/permanent zones, bindings, rich rules, and policies:\\n'+JSON.stringify({zones:d.zones,policies:d.policies},null,2)}}
+
+let portCheckGeneration=0;
+function renderPortCheck(d){
+ const host=$('port-check-results');host.replaceChildren();
+ host.append(el('h2','Port '+d.port));const grid=el('div',undefined,'port-check-grid');
+ const firewall=el('div',undefined,'card');firewall.append(el('h3','Firewall'),el('p',d.summary,'port-check-verdict'));
+ for(const protocol of ['tcp','udp']){
+  const value=d.protocols[protocol];const row=el('p');row.append(el('strong',protocol.toUpperCase()+': '),el('span',value.label));firewall.append(row);
+  if(new Set(Object.values(value.families)).size>1)firewall.append(el('p',Object.entries(value.families).map(([f,v])=>f+': '+({allowed:'allowed',blocked:'not opened',restricted:'restricted',unknown:'needs checking'}[v])).join(' · '),'muted'));
+ }
+ firewall.append(el('p','Checked: '+d.firewall,'muted'));grid.append(firewall);
+ const usage=el('div',undefined,'card');usage.append(el('h3','Service using this port'));
+ if(d.listeners.length){
+  const protocols=[...new Set(d.listeners.map(s=>s.protocol.toUpperCase()))];usage.append(el('p','In use · '+protocols.join(' + '),'port-check-verdict'));
+  for(const socket of d.listeners){
+   const names=socket.services.length?[...new Set(socket.services.map(s=>s.unit||s.name))].join(', '):'Service name unavailable';
+   usage.append(el('p',socket.protocol.toUpperCase()+' · '+names));
+   usage.append(el('p',socket.local_only?'Local connections only ('+socket.address+')':'Listening/bound on '+({'0.0.0.0':'all IPv4 addresses','::':'all IPv6 addresses','*':'all network addresses'}[socket.address]||socket.address),'muted'));
+  }
+ }else if(!d.usage_known){usage.append(el('p','Could not check','port-check-verdict'),el('p','The service list could not be read.','muted'));}
+ else if(d.rules.some(r=>r.action==='Forward')){usage.append(el('p','Forwarding rule found','port-check-verdict'),el('p','No host listener found. The service may be in a container or on another machine.','muted'));}
+ else{usage.append(el('p','Not in use','port-check-verdict'),el('p','No local TCP listener or UDP binding was found.','muted'));}
+ grid.append(usage);host.append(grid);
+ const specific=d.rules.filter(r=>r.port_specific),general=d.rules.filter(r=>!r.port_specific);
+ const rules=el('div',undefined,'card');rules.append(el('h3','Matching port rules'+(specific.length?' · '+specific.length:'')));
+ if(!specific.length)rules.append(el('p','No rule names this port specifically. General rules and defaults can still allow or block it.','muted'));
+ function addRule(parent,r){
+  const row=el('div',undefined,'port-check-rule');const heading=el('p');heading.append(el('strong',r.protocol.toUpperCase()+' · '+r.action),el('span',r.family,'badge'));row.append(heading);
+  row.append(el('p',r.location+' · '+r.scope));
+  if(r.restricted)row.append(el('p','Access depends on an address, network or another condition.','muted'));
+  if(r.copies>1)row.append(el('p',r.copies+' matching copies in this chain. Check for duplicates.','notice warning'));
+  const more=el('details');more.append(el('summary','Rule details'),el('p',r.backend+' · '+r.table+' / '+r.chain,'muted'),el('pre',r.rule));row.append(more);parent.append(row);
+ }
+ for(const r of specific)addRule(rules,r);host.append(rules);
+ if(general.length){const more=el('details',undefined,'card');more.append(el('summary','General rule details (may not be reached)'));for(const r of general)addRule(more,r);host.append(more);}
+ for(const note of d.notes)host.append(el('p',note,'notice warning'));
+ host.append(el('p','Incoming access at this server only. A router or cloud firewall may still block it. Rules with restrictions may depend on your source address or network.','muted'));
+ host.append(el('p','Checked '+new Date(d.checked_utc).toLocaleString()+' · Check again after changing rules or services.','muted'));
+}
+$('port-check-form').onsubmit=async e=>{
+ e.preventDefault();const form=e.currentTarget;if(!form.reportValidity())return;
+ const port=$('port-check-number').value;if(!/^[0-9]{1,5}$/.test(port)||Number(port)<1||Number(port)>65535){notice('Enter one port number from 1 to 65535.',true);return;}
+ const generation=++portCheckGeneration;const button=$('port-check-submit');button.disabled=true;button.textContent='Checking…';$('port-check-results').replaceChildren(el('p','Checking port '+Number(port)+'…','muted'));
+ try{const result=await api('/api/port-check?port='+encodeURIComponent(port));if(generation===portCheckGeneration&&key)renderPortCheck(result);}
+ catch(error){if(generation===portCheckGeneration)$('port-check-results').replaceChildren(el('p','Could not check this port: '+error.message,'notice warning'));}
+ finally{if(generation===portCheckGeneration){button.disabled=false;button.textContent='Check port';}}
+};
+
 $('login').onsubmit=async e=>{e.preventDefault();key=$('key').value;try{status=await api('/api/status');$('key').value='';$('app').classList.remove('hidden');$('login').classList.add('hidden');renderDetection(status.detection);options($('i-backend'),status.backends.map(n=>[n,n]));const engines=[...(status.nft?[['nft','nftables']]:[]),...status.backends.map(n=>[n,n])];options($('m-engine'),engines);options($('raw-engine'),engines);options($('m-iface'),[['','Any interface'],...status.interfaces.filter(n=>n!=='lo').map(n=>[n,n])]);options($('p-iface'),[['','Any interface'],...status.interfaces.map(n=>[n,n])]);$('badges').replaceChildren();for(const [label,value]of [['IPv4 forwarding',status.forwarding.ip],['IPv6 forwarding',status.forwarding.ip6]])$('badges').append(el('span',label+': '+(value===null?'unknown':value?'on':'off'),'badge'));await refresh();try{await refreshManager()}catch(error){notice('Firewall manager status could not be refreshed: '+error.message,true)}}catch(err){key='';notice(err.message,true)}};
  detectionTimer=setInterval(async()=>{if(!key||document.hidden||busy)return;try{const previously=status.detection?.selection_review_required,detection=await api('/api/detection');renderDetection(detection);if(detection.selection_review_required&&!previously)notice(detection.fingerprint_review_required?'Firewall configuration changed outside this application; writes paused until review.':'Firewall manager changed; writes paused until review.',true)}catch(error){notice('Firewall detection poll failed: '+error.message,true)}},15000);
-$('logout').onclick=()=>{setSidebar(false,false);key='';snapshot=nft=ipt=null;$('app').classList.add('hidden');$('login').classList.remove('hidden');$('connection').textContent='Locked';clearInterval(timer);$('auto').value='0';$('all-views').replaceChildren();$('n-rules').replaceChildren();$('i-rules').replaceChildren();$('n-raw').textContent='';$('i-raw').textContent='';$('raw-out').textContent='Output appears here.';$('key').focus()};
+$('logout').onclick=()=>{portCheckGeneration++;$('port-check-results').replaceChildren(el('p','Enter a port number above, for example 80.','muted'));$('port-check-number').value='';$('port-check-submit').disabled=false;$('port-check-submit').textContent='Check port';setSidebar(false,false);key='';snapshot=nft=ipt=null;$('app').classList.add('hidden');$('login').classList.remove('hidden');$('connection').textContent='Locked';clearInterval(timer);$('auto').value='0';$('all-views').replaceChildren();$('n-rules').replaceChildren();$('i-rules').replaceChildren();$('n-raw').textContent='';$('i-raw').textContent='';$('raw-out').textContent='Output appears here.';$('key').focus()};
 const sectionInfo={overview:['All Rules','A complete view of the firewall backends installed on this machine.'],manager:['Firewall Manager','Review ownership and manage UFW or firewalld through its native controls.'],nft:['nftables','Inspect native tables and chains, then add or remove individual rules.'],ipt:['iptables','Manage IPv4 and IPv6 rules using the backend you select.'],masq:['Masquerade','Configure source NAT for an outgoing interface and subnet.'],persistence:['Persistence','Save firewall changes and enable their restoration after boot.'],backups:['Backups','Keep a protected snapshot on the server or download your own copy.'],advanced:['Advanced','Run an explicit firewall command when you need more control.']};
-sectionInfo.display=['Display and Feel','Personalize theme, font, text size, and colors in this browser.'];
+sectionInfo.ports=['Port Checker','One port. Firewall rules and listening services, in plain language.'];
+sectionInfo.display=['Display and Feel','Choose a color profile, font, text size, and animation in this browser.'];
 const mobileNav=window.matchMedia('(max-width:820px)');
 function setSidebar(open,restoreFocus=true){open=Boolean(open&&mobileNav.matches);const wasOpen=$('app').classList.contains('sidebar-open');$('app').classList.toggle('sidebar-open',open);document.body.classList.toggle('drawer-open',open);$('workspace').inert=open;$('menu-toggle').setAttribute('aria-expanded',String(open));$('menu-toggle').setAttribute('aria-label',open?'Close sections':'Open sections');if(open)document.querySelector('.tab.active').focus();else if(wasOpen&&restoreFocus)$('menu-toggle').focus()}
-function activateTab(id,closeMenu=true){if(!Object.hasOwn(sectionInfo,id))id='overview';for(const b of document.querySelectorAll('.tab')){const selected=b.dataset.tab===id;b.classList.toggle('active',selected);b.setAttribute('aria-selected',String(selected));b.tabIndex=selected?0:-1}for(const p of document.querySelectorAll('.panel'))p.classList.toggle('hidden',p.id!==id);$('page-title').textContent=sectionInfo[id][0];$('page-description').textContent=sectionInfo[id][1];history.replaceState(null,'','#'+id);const wasOpen=$('app').classList.contains('sidebar-open');if(closeMenu){setSidebar(false,false);if(wasOpen)$(id).focus({preventScroll:true})}}
+function activateTab(id,closeMenu=true){if(!Object.hasOwn(sectionInfo,id))id='overview';$('app').dataset.activeTab=id;for(const b of document.querySelectorAll('.tab')){const selected=b.dataset.tab===id;b.classList.toggle('active',selected);b.setAttribute('aria-selected',String(selected));b.tabIndex=selected?0:-1}for(const p of document.querySelectorAll('.panel'))p.classList.toggle('hidden',p.id!==id);$('page-title').textContent=sectionInfo[id][0];$('page-description').textContent=sectionInfo[id][1];history.replaceState(null,'','#'+id);const wasOpen=$('app').classList.contains('sidebar-open');if(closeMenu){setSidebar(false,false);if(wasOpen)$(id).focus({preventScroll:true})}}
 const navigationTabs=Array.from(document.querySelectorAll('.tab'));
 for(const [i,b]of navigationTabs.entries()){b.onclick=()=>activateTab(b.dataset.tab);b.onkeydown=e=>{let next=null;if(e.key==='ArrowDown')next=(i+1)%navigationTabs.length;if(e.key==='ArrowUp')next=(i+navigationTabs.length-1)%navigationTabs.length;if(e.key==='Home')next=0;if(e.key==='End')next=navigationTabs.length-1;if(next!==null){e.preventDefault();activateTab(navigationTabs[next].dataset.tab,false);navigationTabs[next].focus()}}}
 $('menu-toggle').onclick=()=>setSidebar(!$('app').classList.contains('sidebar-open'));$('sidebar-close').onclick=()=>setSidebar(false);$('nav-backdrop').onclick=()=>setSidebar(false);mobileNav.addEventListener('change',()=>setSidebar(false,false));

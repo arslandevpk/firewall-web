@@ -177,7 +177,8 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     if [ -z "$deferred_reason" ]; then
         ready=false
         attempt=0
-        while [ "$attempt" -lt 30 ]; do
+        readiness_deadline=$(($(date +%s) + 600))
+        while [ "$attempt" -lt 600 ] && [ "$(date +%s)" -lt "$readiness_deadline" ]; do
             if systemctl is-active --quiet firewall-web.service &&
                 /usr/bin/python3 "$helper" ready --config "$config"; then
                 ready=true
@@ -194,7 +195,7 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
                     systemctl disable firewall-web.service >/dev/null 2>&1 || true
                 fi
             fi
-            echo "Firewall Web did not become ready within 30 seconds. Diagnose with: systemctl status firewall-web.service; journalctl -u firewall-web.service -n 100 --no-pager" >&2
+            echo "Firewall Web did not become ready within 600 seconds. Diagnose with: systemctl status firewall-web.service; journalctl -u firewall-web.service -n 100 --no-pager" >&2
             exit 1
         fi
     fi

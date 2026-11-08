@@ -31,10 +31,13 @@ class FirewallDetectionTests(unittest.TestCase):
         fw.FINGERPRINT_REVIEW_REQUIRED = False
 
     def run_detection(self, *, ufw='missing', firewalld='missing',
-                      nft=NFT_EMPTY, saves=None, nft_permission=False):
+                      nft=NFT_EMPTY, saves=None, nft_permission=False, other_active=(), services=None):
         saves = saves or {}
 
         def probe(name, args=()):
+            if name == 'systemctl' and args and args[0] == 'list-units':
+                return {'installed': True, 'available': True, 'output': '\n'.join(
+                    unit + ' loaded active exited test firewall' for unit in other_active)}
             if name == 'ufw':
                 if ufw == 'missing':
                     return {'installed': False, 'available': False}
@@ -68,6 +71,9 @@ class FirewallDetectionTests(unittest.TestCase):
                     return {'installed': True, 'available': True, 'output': 'public'}
                 if args == ['--permanent', '--get-default-zone']:
                     return {'installed': True, 'available': True, 'output': 'public'}
+                if args in (['--list-all-zones'], ['--permanent', '--list-all-zones']):
+                    return {'installed': True, 'available': True,
+                            'output': 'public\n  interfaces: eth0\n  sources:\n  services: ssh\ntrusted\n  interfaces:\n  sources:\n  services:'}
                 if (args and args[-1] == '--list-all'
                         and any(arg.startswith('--zone=') for arg in args)):
                     return {'installed': True, 'available': True,
@@ -99,9 +105,131 @@ class FirewallDetectionTests(unittest.TestCase):
               mock.patch.object(fw, 'executable',
                                 side_effect=lambda name: '/usr/sbin/' + name if name in installed else None),
               mock.patch.object(fw, '_systemd_service',
-                                return_value={'available': True, 'active': False, 'enabled': False}),
+                                side_effect=lambda name: (services or {}).get(name,
+                                    {'available': True, 'active': False, 'enabled': False})),
               mock.patch.object(fw, 'can_manage_firewall', return_value=True)):
             return fw.detect_firewall()
+
+    def test_inactive_other_manager_does_not_block_direct_rules(self):
+        result = self.run_detection(other_active=(),
+            saves={'iptables-save': SAVE_POPULATED,
+                   'iptables-nft-save': SAVE_POPULATED})
+        self.assertEqual(result['selected_backend'], 'iptables')
+
+    def test_other_manager_unknown_when_systemd_inspection_fails(self):
+        with (mock.patch.object(fw, '_probe', return_value={
+                'installed': True, 'available': False, 'error': 'Failed to connect to bus'}),
+              mock.patch.object(fw, 'executable', side_effect=lambda name:
+                                '/usr/sbin/ferm' if name == 'ferm' else None)):
+            result = fw.other_firewall_managers()
+        self.assertEqual(result, {'active': [], 'unknown': ['ferm.service']})
+
+    def test_service_rule_owners_are_not_treated_as_full_firewall_managers(self):
+        with mock.patch.object(fw, '_probe', return_value={
+                'available': True, 'output': 'docker.service loaded active running Docker\n'
+                                            'tailscaled.service loaded active running Tailscale'}):
+            self.assertEqual(fw.other_firewall_managers(), {'active': [], 'unknown': []})
+
+    def test_boot_service_enable_has_bounded_slow_host_budget(self):
+        with (mock.patch.object(fw, 'executable', return_value='/usr/bin/systemctl'),
+              mock.patch.object(fw.subprocess, 'run', return_value=mock.Mock(
+                  stdout='', stderr='', returncode=0)) as run):
+            fw.run('systemctl', ['enable', 'netfilter-persistent.service'])
+            self.assertEqual(run.call_args.kwargs['timeout'], 180)
+            fw.run('systemctl', ['is-active', '--quiet', 'ufw'])
+            self.assertEqual(run.call_args.kwargs['timeout'], 12)
+
+    def test_daemon_reload_tolerates_slow_systemd_without_relaxing_probes(self):
+        def slow_systemd(argv, **kwargs):
+            if kwargs['timeout'] < 15:
+                raise fw.subprocess.TimeoutExpired(argv, kwargs['timeout'])
+            return mock.Mock(stdout='', stderr='', returncode=0)
+        with (mock.patch.object(fw, 'executable', return_value='/usr/bin/systemctl'),
+              mock.patch.object(fw.subprocess, 'run', side_effect=slow_systemd) as run):
+            self.assertEqual(fw.checked('systemctl', ['daemon-reload']), '')
+            self.assertEqual(run.call_args.kwargs['timeout'], 180)
+            with self.assertRaises(fw.Problem) as caught:
+                fw.run('systemctl', ['is-active', '--quiet', 'ufw'])
+            self.assertEqual(caught.exception.status, 504)
+            self.assertEqual(run.call_args.kwargs['timeout'], 12)
+
+    def test_confirmation_window_starts_after_response_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rid = 'b' * 32
+            path = Path(directory) / (rid + '.json')
+            path.write_text(json.dumps({'id': rid, 'status': 'pending',
+                'expected_after': {}, 'created_at': 100, 'deadline': 190}))
+            with (mock.patch.object(fw, 'ROLLBACK_DIR', Path(directory)),
+                  mock.patch.object(fw.time, 'time', return_value=1000),
+                  mock.patch.object(fw, 'detect_firewall', return_value={
+                      'selected_backend': 'ufw', 'selected_fingerprint': 'after'}),
+                  fw.app.test_request_context('/api/firewalld/rule', method='POST')):
+                response = fw.jsonify(ok=True, pending_rollback_id=rid)
+                fw.headers(response)
+            record = json.loads(path.read_text())
+            self.assertEqual(record['deadline'], 1000 + fw.ROLLBACK_SECONDS)
+
+    def test_rollback_worker_observes_confirmation_without_stale_long_sleep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rid = 'c' * 32
+            path = Path(directory) / (rid + '.json')
+            record = {'id': rid, 'status': 'pending', 'deadline': 100,
+                      'expected_after': {}}
+            path.write_text(json.dumps(record))
+            def confirmed(_):
+                record['status'] = 'confirmed'
+                path.write_text(json.dumps(record))
+            with (mock.patch.object(fw, 'ROLLBACK_DIR', Path(directory)),
+                  mock.patch.object(fw.time, 'time', return_value=0),
+                  mock.patch.object(fw.time, 'sleep', side_effect=confirmed) as sleep):
+                fw.run_rollback(rid)
+            self.assertLessEqual(sleep.call_args.args[0], 1)
+
+    def test_active_manager_and_direct_boot_restore_conflict_blocks_override(self):
+        for manager in ('ufw', 'firewalld'):
+            for service in ('nftables.service', 'netfilter-persistent.service',
+                            'nft-web-restore.service'):
+                with self.subTest(manager=manager, service=service), mock.patch.dict(
+                        fw.os.environ, {'NFT_BACKEND': manager}):
+                    options = {manager: 'active'}
+                    if manager == 'firewalld':
+                        options['nft'] = NFT_FIREWALLD
+                    result = self.run_detection(**options, services={
+                        service: {'available': True, 'active': False, 'enabled': True}})
+                    self.assertEqual(result['selected_backend'], 'inspection')
+                    self.assertFalse(result['manager_can_write'])
+                    self.assertIn(service, result['reason'])
+
+    def test_ufw_route_port_with_any_destination_uses_explicit_to(self):
+        payload = dict(kind='route', action='allow', port='43986', protocol='tcp',
+                       source='any', destination='any', interface_in='lo',
+                       interface_out='lo', state_token='fresh')
+        expected = ['route', 'allow', 'in', 'on', 'lo', 'out', 'on', 'lo',
+                    'to', 'any', 'port', '43986', 'proto', 'tcp']
+        with (fw.app.test_request_context('/api/ufw/rule', method='POST', json=payload),
+              mock.patch.object(fw, '_ufw_state', return_value=({}, [], 'fresh')),
+              mock.patch.object(fw, 'backup', return_value='test-backup'),
+              mock.patch.object(fw, 'checked', return_value='Rule added') as checked):
+            fw.ufw_add_rule()
+        self.assertEqual(checked.call_args.args, ('ufw', expected))
+
+    def test_unsupported_active_firewall_manager_blocks_direct_override(self):
+        for unit in ('ferm.service', 'shorewall.service', 'firehol.service'):
+            with self.subTest(unit=unit), mock.patch.dict(fw.os.environ, {'NFT_BACKEND': 'iptables'}):
+                result = self.run_detection(other_active=(unit,),
+                    saves={'iptables-save': SAVE_POPULATED,
+                           'iptables-nft-save': SAVE_POPULATED})
+                self.assertEqual(result['selected_backend'], 'inspection')
+                self.assertFalse(result['can_write'])
+                self.assertIn(unit, result['reason'])
+
+    def test_unsupported_manager_blocks_supported_manager_override(self):
+        with mock.patch.dict(fw.os.environ, {'NFT_BACKEND': 'ufw',
+                'NFT_BACKEND_ACK': 'active-managers:firewalld,ufw'}):
+            result = self.run_detection(ufw='active', firewalld='active',
+                                       nft=NFT_FIREWALLD, other_active=('ferm.service',))
+        self.assertEqual(result['selected_backend'], 'inspection')
+        self.assertFalse(result['manager_can_write'])
 
     def test_active_ufw_owns_iptables_nft_and_legacy_rules(self):
         result = self.run_detection(
@@ -166,11 +294,45 @@ class FirewallDetectionTests(unittest.TestCase):
               mock.patch.object(fw, '_firewalld_zone', side_effect=[{}, {}]),
               mock.patch.object(fw, '_firewalld_policies', side_effect=[[], []]),
               mock.patch.object(fw, 'checked', side_effect=lambda _, args: {
+                  '--list-all-zones': 'trusted\n  target: default',
                   '--get-active-zones': 'trusted',
                   '--get-default-zone': 'trusted',
               }[args[-1]])):
             state = fw._firewalld_state()
         self.assertEqual(state['permanent_default_zone'], 'trusted')
+
+    def test_zone_inventory_preserves_separate_rules_and_rejects_duplicates(self):
+        output = ('public (active)\n  interfaces: eth0\n  rich rules:\n'
+                  '    rule family="ipv6" source address="2001:db8::/32" accept\n'
+                  'trusted\n  interfaces: eth1\n  ports: 42424/tcp\n')
+        zones = fw._split_firewalld_zones(output)
+        public = fw._parse_firewalld_list_all(zones['public'])
+        trusted = fw._parse_firewalld_list_all(zones['trusted'])
+        self.assertIn('2001:db8::/32', public['rich rules'])
+        self.assertEqual(public['interfaces'], 'eth0')
+        self.assertEqual(trusted['interfaces'], 'eth1')
+        self.assertEqual(trusted['ports'], '42424/tcp')
+        with self.assertRaises(fw.Problem):
+            fw._split_firewalld_zones(output + 'public\n  target: DROP\n')
+
+    def test_inventory_query_count_does_not_grow_with_zone_count(self):
+        names = [f'zone{i}' for i in range(20)]
+        text = '\n'.join(name + '\n  target: default' for name in names)
+        with (mock.patch.object(fw, '_firewalld_zones', return_value=names),
+              mock.patch.object(fw, '_firewalld_policies', return_value=[]),
+              mock.patch.object(fw, 'checked', side_effect=lambda _, args:
+                                text if args[-1] == '--list-all-zones' else 'zone0') as calls):
+            state = fw._firewalld_state()
+        self.assertEqual(len(state['zones']), 20)
+        self.assertLessEqual(calls.call_count, 4)
+        self.assertFalse(any('--list-all' in call.args[1] for call in calls.call_args_list))
+
+    def test_malformed_zone_inventory_disables_writes(self):
+        with mock.patch.object(fw, '_split_firewalld_zones',
+                               side_effect=fw.Problem('Incomplete inventory', 503)):
+            result = self.run_detection(firewalld='active', nft=NFT_FIREWALLD)
+        self.assertEqual(result['selected_backend'], 'inspection')
+        self.assertFalse(result['manager_can_write'])
 
     def test_firewalld_state_preserves_multiline_ipv6_rich_rules(self):
         rich_rule = ('rule family="ipv6" source address="2001:db8::/32" '
@@ -292,8 +454,8 @@ class FirewallDetectionTests(unittest.TestCase):
         paired = fw._ufw_rule_insert_args(1, '22/tcp ALLOW IN Anywhere', True)
         single = fw._ufw_rule_insert_args(1, '22/tcp ALLOW IN Anywhere', False)
         ipv6 = fw._ufw_rule_insert_args(1, '22/tcp (v6) ALLOW IN Anywhere (v6)', False)
-        self.assertEqual(paired, ['insert', '1', 'allow', 'in', 'port', '22', 'proto', 'tcp'])
-        self.assertIn('0.0.0.0/0', single)
+        self.assertEqual(paired, ['insert', '1', 'allow', 'in', 'to', 'any', 'port', '22', 'proto', 'tcp'])
+        self.assertEqual(single, ['insert', '1', 'allow', 'in', 'from', '0.0.0.0/0', 'to', 'any', 'port', '22', 'proto', 'tcp'])
         self.assertIn('::/0', ipv6)
 
     def test_ufw_route_deletion_rollback_reconstructs_both_interfaces(self):
@@ -441,6 +603,7 @@ class FirewallDetectionTests(unittest.TestCase):
               mock.patch.object(fw, 'backup', return_value='backup.json'),
               mock.patch.object(fw, 'prepare_rollback', return_value='rollback-id') as prepare,
               mock.patch.object(fw, 'commit_rollback') as commit,
+              mock.patch.object(fw, 'arm_rollback_confirmation') as arm,
               mock.patch.object(fw, 'checked', return_value='') as checked):
             token = fw.signature(fw.configuration_only(current))
             response = client.post('/api/firewalld/rule',
@@ -453,6 +616,7 @@ class FirewallDetectionTests(unittest.TestCase):
                                        ['--zone=trusted', '--add-source=192.0.2.0/24'])
         prepare.assert_called_once()
         commit.assert_called_once()
+        arm.assert_called_once_with('rollback-id')
 
     def test_unsupported_firewalld_rich_rule_is_rejected(self):
         detection = {'selected_backend': 'firewalld', 'manager_can_write': True,
