@@ -47,11 +47,16 @@ jobs:
           cd dist
           sha256sum "firewall-web_${version}_${PACKAGE_ARCH}.deb" > SHA256SUMS
           sha256sum -c SHA256SUMS
+      - name: Test clean Ubuntu and Debian installations
+        run: bash packaging/test-clean-deb-install.sh
+      - name: Include repository-aware installer
+        run: cp packaging/install-deb.sh dist/install-deb.sh
       - uses: actions/upload-artifact@v4
         with:
           name: firewall-web-debian-${{ matrix.architecture }}
           path: |
             dist/firewall-web_*.deb
+            dist/install-deb.sh
             dist/SHA256SUMS
             dist/SOURCE_COMMIT
             dist/SOURCE_SHA256

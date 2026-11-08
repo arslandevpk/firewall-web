@@ -44,3 +44,21 @@ and reports uncertainty for unsupported or conditional rule paths.
 The Debian review artifact workflow builds both architectures from the exact
 commit and includes package checksums and source identity. It creates no GitHub
 release or tag. The earlier November 7 delivery deadline was missed.
+
+## Installing the downloaded Debian artifact
+
+Extract the artifact ZIP, then run in that directory:
+
+```sh
+sudo bash ./install-deb.sh ./firewall-web_1.0.5_amd64.deb
+# On ARM64 use firewall-web_1.0.5_arm64.deb instead.
+```
+
+The wrapper refreshes package lists and enables Ubuntu Universe, where the
+Python dependencies are supplied. On Debian it enables main in existing official sources if missing. Source files are backed up; repository URLs, suites and signing keys are retained.
+APT resolves dependencies before a .deb maintainer script can execute, so the
+.deb cannot repair missing repositories itself. Direct apt installation still
+works when the required repository components and package lists are present.
+The wrapper does not disable dependency checks, modify system Python through
+pip, add third-party repositories, or mix distribution releases. Repository
+errors and unresolved holds/pins stop installation with a diagnostic.
